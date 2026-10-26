@@ -1,0 +1,257 @@
+{
+   "sources" : [
+      {
+         "usage" : "toplevel",
+         "filename" : "arxiv.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "checklist.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "jpeg/fig/ablation_pe_scatter/MipNeRF360_PSNR.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "jpeg/fig/app_ablation/featdim/featdim_LPIPS.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "jpeg/fig/app_ablation/featdim/featdim_PSNR.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "jpeg/fig/app_ablation/featdim/featdim_SSIM.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "jpeg/fig/app_ablation/featdim/featdim_Size.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "jpeg/fig/app_ablation/recursion/recursion_LPIPS.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "jpeg/fig/app_ablation/recursion/recursion_PSNR.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "jpeg/fig/app_ablation/recursion/recursion_SSIM.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "jpeg/fig/app_ablation/recursion/recursion_Size.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "jpeg/fig/app_ablation/regbit/regbit_LPIPS.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "jpeg/fig/app_ablation/regbit/regbit_PSNR.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "jpeg/fig/app_ablation/regbit/regbit_SSIM.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "jpeg/fig/app_ablation/regbit/regbit_Size.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "jpeg/fig/app_ablation/rego/rego_LPIPS.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "jpeg/fig/app_ablation/rego/rego_PSNR.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "jpeg/fig/app_ablation/rego/rego_SSIM.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "jpeg/fig/app_ablation/rego/rego_Size.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "jpeg/fig/effect_of_recursion/quantitative.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "jpeg/fig/histogram_octree/bonsai_non_empty_subboxes.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "jpeg/fig/histogram_octree/bonsai_value_frequency.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "jpeg/fig/histogram_octree/drjohnson_non_empty_subboxes.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "jpeg/fig/histogram_octree/drjohnson_value_frequency.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "jpeg/fig/histogram_octree/garden_non_empty_subboxes.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "jpeg/fig/histogram_octree/garden_value_frequency.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "jpeg/fig/histogram_octree/non_empty_subboxes.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "jpeg/fig/histogram_octree/room_non_empty_subboxes.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "jpeg/fig/histogram_octree/room_value_frequency.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "jpeg/fig/quantitative_scatter_plot/DeepBlending_LPIPS.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "jpeg/fig/quantitative_scatter_plot/DeepBlending_PSNR.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "jpeg/fig/quantitative_scatter_plot/DeepBlending_SSIM.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "jpeg/fig/quantitative_scatter_plot/MipNeRF360_LPIPS.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "jpeg/fig/quantitative_scatter_plot/MipNeRF360_PSNR.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "jpeg/fig/quantitative_scatter_plot/MipNeRF360_SSIM.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "jpeg/fig/quantitative_scatter_plot/TanksAndTemples_LPIPS.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "jpeg/fig/quantitative_scatter_plot/TanksAndTemples_PSNR.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "jpeg/fig/quantitative_scatter_plot/TanksAndTemples_SSIM.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "jpeg/fig/training_curve.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "jpeg/fig/training_curve_x3.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "math_commands.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "table/ablation_compression_modules.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "table/app_ablation_featdim.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "table/app_ablation_recursion.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "table/app_ablation_regbit.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "table/app_ablation_rego.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "table/app_decoding_time_smolgs_base.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "table/app_decoding_time_smolgs_small.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "table/app_encoding_time_smolgs_base.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "table/app_encoding_time_smolgs_small.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "table/app_reconstruction_per_scene.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "table/app_reconstruction_smolgs_base.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "table/app_reconstruction_smolgs_small.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "table/decoding_time_smolgs_base.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "table/decoding_time_smolgs_small.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "table/encoding_time_smolgs_base.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "table/encoding_time_smolgs_small.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "table/fps_comparison.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "table/quantitative_benchmark.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "table/size_of_component.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "table/size_of_component_smolgs_base.tex"
+      },
+      {
+         "usage" : "ignore",
+         "filename" : "table/size_of_component_smolgs_small.tex"
+      }
+   ],
+   "spec_version" : 1,
+   "texlive_version" : "2025",
+   "process" : {
+      "compiler" : "pdflatex"
+   }
+}

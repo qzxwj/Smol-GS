@@ -1,0 +1,10 @@
+# Install the CUDA PyTorch wheels separately, before compiling extensions.
+setuptools==75.1.0
+wheel==0.44.0
+numpy==1.26.4
+scipy==1.14.1
+Pillow==10.4.0
+plyfile==1.1
+lpips==0.1.4
+ninja==1.11.1.1
+tqdm==4.66.5
