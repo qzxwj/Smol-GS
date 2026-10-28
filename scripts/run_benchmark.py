@@ -24,13 +24,20 @@ def main(dataset=None):
     p.add_argument('--data-root', '--data_root', default=str(ROOT.parent/'data'))
     p.add_argument('--output-root', '--output_root', default=str(ROOT/'outputs'))
     p.add_argument('--variant', choices=['small', 'base', 'large'], default='base')
+    p.add_argument('--config', help='Full model configuration passed to every fresh training run')
     p.add_argument('--gpu', type=int, default=2)
     p.add_argument('--python', default=sys.executable)
     p.add_argument('--dry-run', action='store_true')
     p.add_argument('--resume', action='store_true', help='Resume each latest checkpoint, evaluate completed runs')
     p.add_argument('--log-interval', type=int, default=50)
+    p.add_argument('--monitor-octree', action='store_true', help='Record positional MLP activity while training')
     p.add_argument('--skip-lpips', action='store_true', help='Explicitly omit LPIPS when weights are unavailable')
     args = p.parse_args()
+    config_path = None
+    if args.config:
+        config_path = Path(args.config).resolve()
+        if not config_path.is_file():
+            p.error('Configuration file missing: '+str(config_path))
     datasets = list(SCENES) if args.dataset == 'all' else [args.dataset]
     unknown = set(args.scene or []) - {s for d in datasets for s in SCENES[d]}
     if unknown:
@@ -51,6 +58,10 @@ def main(dataset=None):
                      '-i', image_folder, '-r', '1', '--eval', '--variant', args.variant,
                      '--iterations', '35000', '--codec', 'cuda',
                      '--log-interval', str(args.log_interval)]
+            if config_path:
+                train.extend(['--config', str(config_path)])
+            if args.monitor_octree:
+                train.append('--monitor-octree')
             evaluation = [args.python, str(ROOT/'render.py'), '-m', str(output/'model.smolgs.zip'),
                           '-s', str(source), '-i', image_folder, '-r', '1', '-o', str(output/'test/ours_35000'),
                           '--save-images']

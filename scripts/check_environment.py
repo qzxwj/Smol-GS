@@ -4,7 +4,6 @@ from pathlib import Path
 import importlib
 import json
 import platform
-import subprocess
 import sys
 import torch
 
@@ -20,10 +19,12 @@ def main():
     if torch.cuda.is_available():
         report['gpu'] = torch.cuda.get_device_name()
         report['compute_capability'] = list(torch.cuda.get_device_capability())
-    for name in ['diff_gaussian_rasterization', 'simple_knn._C', '_gridencoder', 'arithmetic', 'lpips']:
+    for name in ['diff_gaussian_rasterization', 'simple_knn._C', '_gridencoder', 'tinycudann', 'arithmetic', 'lpips']:
         try:
             module = importlib.import_module(name)
             report['extensions'][name] = {'available': True, 'path': module.__file__}
+            if name == 'tinycudann':
+                report['extensions'][name]['network_support'] = bool(module.modules._C.has_networks())
         except (ImportError, OSError) as error:
             report['extensions'][name] = {'available': False, 'error': str(error)}
     print(json.dumps(report, indent=2))

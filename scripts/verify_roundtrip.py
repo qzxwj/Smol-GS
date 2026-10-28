@@ -8,7 +8,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from utils.checkpoint import load_checkpoint
-from smolgs.codec import decode_model
+from smolgs.codec import decode_model, quantized_hash_reference
 from scene.dataset_readers import load_scene
 from gaussian_renderer import render
 
@@ -34,6 +34,8 @@ def main():
     if len(checkpoint.xyz) != len(decoded.xyz):
         raise AssertionError('Splat count changed during codec roundtrip')
     checkpoint.eval()
+    float_checkpoint = checkpoint
+    checkpoint = quantized_hash_reference(checkpoint)
     decoded.eval()
     errors = []
     with torch.no_grad():
@@ -41,6 +43,7 @@ def main():
             camera = camera.to(args.device)
             before_package = render(checkpoint, camera, step, args.renderer)
             after_package = render(decoded, camera, step, args.renderer)
+            original_image = render(float_checkpoint, camera, step, args.renderer)['image']
             # Rasterization has hard support/alpha cutoffs: tiny floating-point
             # changes can affect a few pixels. Check attributes separately and
             # constrain both worst-pixel and mean image error.
@@ -55,11 +58,12 @@ def main():
                 raise AssertionError(f'Render disagreement: max={float(difference.max())}, '
                                      f'mean={float(difference.mean())}')
             errors.append({'name': camera.name, 'max_abs': float(difference.max()),
-                           'mean_abs': float(difference.mean()), 'attributes_max_abs': attribute_errors})
-    report.update({'checkpoint_step': step, 'render_agreement': True, 'views': errors,
+                           'mean_abs': float(difference.mean()), 'attributes_max_abs': attribute_errors,
+                           'checkpoint_to_binary_max_abs': float((original_image-before).abs().max()),
+                           'checkpoint_to_binary_mean_abs': float((original_image-before).abs().mean())})
+    report.update({'checkpoint_step': step, 'render_agreement': True, 'reference': 'checkpoint with exported binary hash signs', 'views': errors,
                    'criteria': {'attributes_atol': 2e-5, 'attributes_rtol': 2e-5,
-                                'image_max_abs': args.image_max_abs, 'image_mean_abs': args.image_mean_abs,
-                                'quantized_symbols': 'all stream SHA-256 checks passed during decode'},
+                                'image_max_abs': args.image_max_abs, 'image_mean_abs': args.image_mean_abs},
                    'note': 'Codec consistency check only; this does not establish paper metric reproduction.'})
     Path(args.output).write_text(json.dumps(report, indent=2)+'\n')
     print(json.dumps(report, indent=2))

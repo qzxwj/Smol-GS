@@ -1,0 +1,5 @@
+{
+  "geometry_mode": "explicit",
+  "explicit_scaling_lr": 0.005,
+  "explicit_rotation_lr": 0.001
+}

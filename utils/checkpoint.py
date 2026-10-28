@@ -5,7 +5,7 @@ import json
 import numpy as np
 import torch
 from arguments import Config
-from scene.gaussian_model import SmolGS
+from scene.gaussian_model import SmolGS, ADC_POLICY
 
 
 def load_torch(path, map_location='cpu'):
@@ -20,9 +20,13 @@ def save_checkpoint(path, model, optimizer, step, metadata=None):
     rng = {'python': random.getstate(), 'numpy': np.random.get_state(), 'torch': torch.get_rng_state()}
     if torch.cuda.is_available():
         rng['cuda'] = torch.cuda.get_rng_state_all()
-    payload = {'format': 'smolgs-checkpoint-v1', 'config': model.config.to_dict(),
+    checkpoint_format = ('smolgs-checkpoint-v4-explicit' if model.config.geometry_mode == 'explicit'
+                         else 'smolgs-checkpoint-v3')
+    payload = {'format': checkpoint_format, 'geometry_mode': model.config.geometry_mode,
+               'hash_model': 'hac-binary-mixed-detached-v1', 'config': model.config.to_dict(),
                'model': model.state_dict(), 'optimizer': optimizer.state_dict() if optimizer else None,
-               'step': step, 'rng': rng, 'metadata': metadata or {}}
+               'step': step, 'rng': rng, 'metadata': metadata or {},
+               'adc_policy': dict(model.adc_policy)}
     temporary = path.with_suffix(path.suffix+'.tmp')
     torch.save(payload, str(temporary))
     temporary.replace(path)
@@ -35,17 +39,20 @@ def save_checkpoint(path, model, optimizer, step, metadata=None):
 
 def load_checkpoint(path, device='cpu', resume=False):
     payload = load_torch(path, 'cpu')
-    if payload.get('format') != 'smolgs-checkpoint-v1':
-        raise ValueError('Unsupported checkpoint format')
-    config = Config(**payload['config'])
+    if (payload.get('format') not in ('smolgs-checkpoint-v3', 'smolgs-checkpoint-v4-explicit')
+            or payload.get('hash_model') != 'hac-binary-mixed-detached-v1'):
+        raise ValueError('Unsupported checkpoint format/hash model; expected v3 neural or v4-explicit')
+    config = Config.from_saved(payload['config'])
+    expected_mode = 'explicit' if payload['format'] == 'smolgs-checkpoint-v4-explicit' else 'neural'
+    if config.geometry_mode != expected_mode or payload.get('geometry_mode', 'neural') != expected_mode:
+        raise ValueError('Checkpoint geometry mode/format mismatch; start a fresh run to change geometry')
+    if resume and bool(payload['model']['decoded']):
+        raise ValueError('Decoded archives are inference-only; resume from a training checkpoint')
+    stored_policy = payload.get('adc_policy')
+    if stored_policy != ADC_POLICY:
+        raise ValueError('Unsupported ADC checkpoint policy; start a fresh run')
     model = SmolGS(config, len(payload['model']['xyz']), device)
     state = payload['model']
-    if 'scene_extent' not in state:
-        if resume:
-            raise ValueError('Legacy ADC checkpoint has no fixed camera extent; use it for diagnosis/rendering, '
-                             'and start a fresh run for the size-aware ADC policy')
-        # Old results remain readable without silently changing their training history.
-        state = {**state, 'scene_extent': model.scene_extent}
     model.load_state_dict(state)
     model.xyz.requires_grad_(not bool(model.coordinate_frozen))
     optimizer = model.make_optimizer() if resume else None

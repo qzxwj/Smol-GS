@@ -4,29 +4,6 @@
   "octree_feature_dim": 8,
   "mlp_width": 128,
   "octree_mlp_width": 64,
-  "hash_features": 4,
-  "hash_log2_3d": 13,
-  "hash_log2_2d": 15,
-  "resolutions_3d": [
-    18,
-    24,
-    33,
-    44,
-    59,
-    80,
-    108,
-    148,
-    201,
-    275,
-    376,
-    514
-  ],
-  "resolutions_2d": [
-    130,
-    258,
-    514,
-    1026
-  ],
   "iterations": 35000,
   "warmup_until": 500,
   "densify_until": 15000,
@@ -86,8 +63,29 @@
       1e-05
     ]
   },
-  "adc_split_scale_ratio": 0.01,
-  "adc_prune_scale_ratio": 0.1,
-  "adc_size_prune_from": 3000,
-  "coordinate_max_collision_fraction": 0.5
+  "coordinate_max_collision_fraction": 0.5,
+  "hash_detach_coordinates": true,
+  "hash_features": 4,
+  "hash_log2_3d": 13,
+  "hash_log2_2d": 15,
+  "resolutions_3d": [
+    18,
+    24,
+    33,
+    44,
+    59,
+    80,
+    108,
+    148,
+    201,
+    275,
+    376,
+    514
+  ],
+  "resolutions_2d": [
+    130,
+    258,
+    514,
+    1026
+  ]
 }

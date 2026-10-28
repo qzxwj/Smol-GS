@@ -1,5 +1,7 @@
 """Hyperparameters transcribed from arxiv.tex, sections 3 and A."""
 from dataclasses import asdict, dataclass, field
+from argparse import BooleanOptionalAction
+from pathlib import Path
 import json
 import math
 
@@ -11,11 +13,11 @@ class Config:
     octree_feature_dim: int = 8
     mlp_width: int = 128
     octree_mlp_width: int = 64
-    hash_features: int = 4
-    hash_log2_3d: int = 13
-    hash_log2_2d: int = 15
-    resolutions_3d: tuple = (18, 24, 33, 44, 59, 80, 108, 148, 201, 275, 376, 514)
-    resolutions_2d: tuple = (130, 258, 514, 1026)
+    appearance_backend: str = "torch"
+    opacity_activation: str = "abs_tanh"
+    geometry_mode: str = "neural"
+    explicit_scaling_lr: float = 0.005
+    explicit_rotation_lr: float = 0.001
     iterations: int = 35000
     warmup_until: int = 500
     densify_until: int = 15000
@@ -30,25 +32,22 @@ class Config:
     # The following choices are not specified in the paper; see docs/FIDELITY.md.
     adc_interval: int = 100
     invisible_patience: int = 1000
+    # Inria 3DGS size boundary, applied to current-camera rendered axes.
     adc_split_scale_ratio: float = 0.01
-    adc_prune_scale_ratio: float = 0.1
-    adc_size_prune_from: int = 3000
-    adc_size_prune_until: int = 20000
-    octree_init: str = "torch"
-    octree_init_seed: int = 1729
-    octree_init_gain: float = 1.0
-    octree_activation: str = "relu"
+    octree_backend: str = "torch"
+    octree_init_seed: int = 1337
     feature_init_std: float = 0.01
-    octree_input_center: float = 0.0
-    octree_input_center_mode: str = "constant"
-    octree_input_mean: tuple = ()
-    octree_hidden_center_mode: str = "none"
-    octree_hidden_center: tuple = ()
     coordinate_max_collision_fraction: float = 0.5
     feature_step: float = 1.0
     scale_step: float = 0.001
     rate_bin_half_width: float = 0.5
     hash_backend: str = "auto"
+    hash_detach_coordinates: bool = True
+    hash_features: int = 4
+    hash_log2_3d: int = 13
+    hash_log2_2d: int = 15
+    resolutions_3d: tuple = (18, 24, 33, 44, 59, 80, 108, 148, 201, 275, 376, 514)
+    resolutions_2d: tuple = (130, 258, 514, 1026)
     learning_rates: dict = field(default_factory=lambda: {
         "xyz": [0.0002, 1e-5], "features": [0.0075, 0.0075],
         "log_scales": [0.01, 0.002], "opacity_mlp": [0.002, 2e-5],
@@ -58,46 +57,58 @@ class Config:
     })
 
     def __post_init__(self):
+        if self.geometry_mode not in ('neural', 'explicit'):
+            raise ValueError('geometry_mode must be neural or explicit')
+        for name in ('explicit_scaling_lr', 'explicit_rotation_lr'):
+            if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
+                raise ValueError(f'{name} must be finite and positive')
+        if self.opacity_activation != 'abs_tanh':
+            raise ValueError('Only paper opacity_activation=abs_tanh is supported')
         if not 1 <= self.octree_depth <= 20:
             raise ValueError("octree_depth must be in [1, 20] (Morton codes use int64)")
         if not 0 <= self.warmup_until < self.densify_until < self.compact_until < self.feature_until < self.iterations:
             raise ValueError("The five training stages must be strictly ordered")
         if self.hash_backend not in ("auto", "cuda", "torch"):
-            raise ValueError("hash_backend must be auto, cuda or torch")
+            raise ValueError("Binary hash_backend must be auto, cuda or torch")
+        if not self.hash_detach_coordinates:
+            raise ValueError('Binary hash requires hash_detach_coordinates=True')
+        if (self.hash_features not in (1, 2, 4, 8) or
+                not 1 <= self.hash_log2_3d <= 24 or not 1 <= self.hash_log2_2d <= 24):
+            raise ValueError('Invalid binary hash table configuration')
+        for name in ('resolutions_3d', 'resolutions_2d'):
+            values = tuple(getattr(self, name))
+            if not values or any(not isinstance(r, int) or r < 3 for r in values):
+                raise ValueError('Hash resolutions must be integers >= 3')
+            setattr(self, name, values)
         if self.adc_interval < 1 or self.invisible_patience < 1:
             raise ValueError("ADC interval and invisible patience must be positive")
-        if not 0 < self.adc_split_scale_ratio < self.adc_prune_scale_ratio:
-            raise ValueError("ADC scale ratios must satisfy 0 < split < prune")
-        if not math.isfinite(self.octree_init_gain) or self.octree_init_gain <= 0:
-            raise ValueError("octree_init_gain must be finite and positive")
-        if self.octree_input_center_mode not in ("constant", "sfm", "checkpoint"):
-            raise ValueError("octree_input_center_mode must be constant, sfm or checkpoint")
-        if self.octree_input_center_mode == "checkpoint" and not self.octree_input_mean:
-            raise ValueError("Checkpoint bit centering requires the recorded vector")
-        if self.octree_input_mean and (self.octree_input_center_mode not in ("sfm", "checkpoint") or
-                len(self.octree_input_mean) != 3*self.octree_depth or
-                not all(math.isfinite(float(x)) and 0 <= x <= 1 for x in self.octree_input_mean)):
-            raise ValueError("Invalid fixed bit centering vector")
-        if self.octree_hidden_center_mode not in ("none", "sfm", "checkpoint"):
-            raise ValueError("octree_hidden_center_mode must be none, sfm or checkpoint")
-        if self.octree_hidden_center_mode == "checkpoint" and not self.octree_hidden_center:
-            raise ValueError("Checkpoint hidden centering requires the recorded vector")
-        if self.octree_hidden_center and (self.octree_hidden_center_mode not in ("sfm", "checkpoint") or
-                len(self.octree_hidden_center) != self.octree_mlp_width or
-                not all(math.isfinite(float(x)) for x in self.octree_hidden_center)):
-            raise ValueError("Invalid fixed hidden centering vector")
-        if not 0 <= self.octree_input_center <= 1:
-            raise ValueError("octree_input_center must be in [0, 1]")
-        if self.octree_activation not in ("relu", "leaky") or self.feature_init_std <= 0:
-            raise ValueError("Invalid positional activation or feature initialization std")
-        if self.octree_init not in ("torch", "kaiming"):
-            raise ValueError("octree_init must be torch or kaiming")
-        if self.adc_size_prune_until < self.adc_size_prune_from:
-            raise ValueError("Size-prune end must not precede its start")
-        if self.adc_size_prune_from < 0 or not 0 <= self.coordinate_max_collision_fraction < 1:
-            raise ValueError("Invalid size-prune start or coordinate collision limit")
+        if not math.isfinite(self.adc_split_scale_ratio) or self.adc_split_scale_ratio <= 0:
+            raise ValueError("ADC split scale ratio must be finite and positive")
+        if not math.isfinite(self.feature_init_std) or self.feature_init_std <= 0:
+            raise ValueError("feature_init_std must be finite and positive")
+        if self.octree_backend not in ('torch', 'tcnn'):
+            raise ValueError('octree_backend must be torch or tcnn')
+        if self.octree_backend == 'tcnn':
+            if self.octree_mlp_width not in (16, 32, 64, 128):
+                raise ValueError('FullyFusedMLP width must be 16, 32, 64 or 128')
+        if self.appearance_backend not in ('torch', 'tcnn'):
+            raise ValueError('appearance_backend must be torch or tcnn')
+        if self.appearance_backend == 'tcnn' and self.mlp_width not in (16, 32, 64, 128):
+            raise ValueError('FullyFusedMLP width must be 16, 32, 64 or 128')
+        if not 0 <= self.coordinate_max_collision_fraction < 1:
+            raise ValueError("Invalid coordinate collision limit")
         if self.feature_step <= 0 or self.scale_step <= 0 or self.rate_bin_half_width <= 0:
             raise ValueError("Quantization steps and rate bin half width must be positive")
+
+    def optimizer_rates(self):
+        """Keep appearance schedules; explicit geometry uses RDO's fixed rates."""
+        rates = {name: list(pair) for name, pair in self.learning_rates.items()}
+        if self.geometry_mode == 'explicit':
+            rates.pop('scale_mlp', None)
+            rates.pop('rotation_mlp', None)
+            rates['log_scales'] = [self.explicit_scaling_lr]*2
+            rates['rotations'] = [self.explicit_rotation_lr]*2
+        return rates
 
     def stage(self, step):
         if step <= self.warmup_until:
@@ -114,8 +125,14 @@ class Config:
         return asdict(self)
 
     @classmethod
+    def from_saved(cls, values):
+        if values.get('opacity_activation') != 'abs_tanh':
+            raise ValueError('Saved model must record paper opacity_activation=abs_tanh')
+        return cls(**values)
+
+    @classmethod
     def load(cls, path=None, variant="base"):
-        values = json.loads(open(path).read()) if path else {}
+        values = json.loads(Path(path).read_text()) if path else {}
         if not path:
             values["lambda_opacity"] = {"small": 4e-7, "base": 3e-7, "large": 1e-7}[variant]
         return cls(**values)
@@ -133,10 +150,13 @@ def add_model_optimization_arguments(parser):
     }
     default = Config()
     for name, value in default.to_dict().items():
-        if name in ('learning_rates', 'resolutions_2d', 'resolutions_3d', 'octree_hidden_center', 'octree_input_mean'):
+        if name in ('learning_rates', 'resolutions_3d', 'resolutions_2d'):
             continue
         options = list(dict.fromkeys(['--'+name.replace('_', '-'), '--'+name]+aliases.get(name, [])))
-        group.add_argument(*options, dest='config_'+name, type=type(value), default=None)
+        if isinstance(value, bool):
+            group.add_argument(*options, dest='config_'+name, action=BooleanOptionalAction, default=None)
+        else:
+            group.add_argument(*options, dest='config_'+name, type=type(value), default=None)
     conventional = {'xyz': 'position', 'features': 'feature', 'log_scales': 'scaling',
                     'opacity_mlp': 'mlp_opacity', 'color_mlp': 'mlp_color',
                     'rotation_mlp': 'mlp_rotation', 'scale_mlp': 'mlp_scaling',

@@ -85,6 +85,8 @@ def main(args=None):
         if args.max_initial_points is None:
             args.max_initial_points = metadata.get('max_initial_points')
         config = model.config
+        if args.config_geometry_mode is not None and args.config_geometry_mode != config.geometry_mode:
+            raise ValueError('Cannot change geometry mode when resuming; start a fresh run')
     else:
         config = config_from_args(args)
         points = load_points(args.source_path)
@@ -103,11 +105,17 @@ def main(args=None):
                         'white_background': args.white_background},
                 'train_names': [c.name for c in train_cameras], 'test_names': [c.name for c in test_cameras],
                 'renderer': args.renderer, 'adc_gradient_space': 'screen_xy',
-                'adc_topology_policy': '3dgs-size-aware-v1',
-                'adc_size_prune_until': config.adc_size_prune_until,
-                'octree_initialization': config.octree_init,
+                'adc_topology_policy': model.adc_policy['topology_policy'],
                 'max_initial_points': args.max_initial_points,
                 'max_splats': args.max_splats, 'seed': args.seed,
+                'hash_backend': config.hash_backend,
+                'hash_detach_coordinates': config.hash_detach_coordinates,
+                'appearance_backend': config.appearance_backend,
+                'opacity_activation': config.opacity_activation,
+                'octree_backend': config.octree_backend,
+                'geometry_mode': config.geometry_mode,
+                'geometry_quantization': 'none' if config.geometry_mode == 'explicit' else 'scalar-controller',
+                'effective_learning_rates': config.optimizer_rates(),
                 'implementation': 'independent-paper-reproduction'}
     (output/'config.json').write_text(json.dumps(config.to_dict(), indent=2)+'\n')
     # Familiar 3DGS filename, stored as JSON and never evaluated as Python code.
@@ -120,7 +128,7 @@ def main(args=None):
                       'train_views': len(train_cameras), 'test_views': len(test_cameras),
                       'device': str(model.xyz.device), 'renderer': args.renderer,
                       'adc_gradient_space': 'screen_xy',
-                      'adc_topology_policy': '3dgs-size-aware-v1',
+                      'adc_topology_policy': model.adc_policy['topology_policy'],
                       **model.geometry_summary()}), flush=True)
     started = time.perf_counter()
     stage_before = None

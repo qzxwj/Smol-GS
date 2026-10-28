@@ -1,0 +1,19 @@
+{
+  "appearance_backend": "tcnn",
+  "octree_backend": "tcnn",
+  "octree_init_seed": 1337,
+  "opacity_activation": "abs_tanh",
+  "hash_backend": "cuda",
+  "learning_rates": {
+    "xyz": [0.0002, 0.00001],
+    "features": [0.0075, 0.0075],
+    "log_scales": [0.01, 0.002],
+    "opacity_mlp": [0.002, 0.00002],
+    "color_mlp": [0.008, 0.00005],
+    "rotation_mlp": [0.004, 0.004],
+    "scale_mlp": [0.004, 0.004],
+    "entropy_mlp": [0.005, 0.00001],
+    "octree_mlp": [0.001, 0.001],
+    "hash_encoder": [0.005, 0.00001]
+  }
+}

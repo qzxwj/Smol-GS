@@ -1,4 +1,4 @@
-"""Standalone ZIP container: occupancy tree, arithmetic attributes, MLPs, binary hash.
+"""Standalone ZIP container: occupancy tree, arithmetic attributes, MLPs, binary mixed hash.
 
 No checkpoint, source scene, or SfM data is required for decoding.
 """
@@ -12,7 +12,7 @@ import time
 import zipfile
 import numpy as np
 import torch
-from utils.arithmetic import encode_gaussian, decode_gaussian
+from utils.arithmetic import encode_gaussian_symbols, decode_gaussian_symbols
 from utils.checkpoint import load_torch
 from arguments import Config
 from scene.gaussian_model import SmolGS
@@ -50,11 +50,31 @@ def _network_files(model):
     return files, binary
 
 
+@torch.no_grad()
+def quantized_hash_reference(model):
+    """Export reference using exactly the packed binary table signs."""
+    reference = SmolGS(Config(**model.config.to_dict()), len(model.xyz), str(model.xyz.device))
+    reference.load_state_dict(model.state_dict())
+    for name, parameter in reference.hash_encoder.named_parameters():
+        parameter.copy_(torch.where(parameter >= 0, 1., -1.))
+    reference.eval()
+    return reference
+
+
 def _canonical_model(model, context_device):
-    """Binary hash weights are identical in the training and stored networks."""
+    """Create the same backend on the recorded context device."""
     config = Config(**model.config.to_dict())
-    # CPU context is deterministic across render devices; CUDA uses HAC's native grid.
-    config.hash_backend = 'torch' if context_device == 'cpu' else 'cuda'
+    if context_device == 'cpu':
+        config.hash_backend = 'torch'
+    elif config.hash_backend == 'auto':
+        # Pin the actual interpolation backend in the archive; never change
+        # arithmetic contexts via an automatic fallback on another machine.
+        try:
+            __import__('_gridencoder')
+        except ImportError:
+            config.hash_backend = 'torch'
+        else:
+            config.hash_backend = 'cuda'
     result = SmolGS(config, device=context_device)
     state = {name: value for name, value in model.state_dict().items()
              if name.startswith(('opacity_mlp.', 'color_mlp.', 'rotation_mlp.', 'scale_mlp.',
@@ -68,8 +88,29 @@ def _canonical_model(model, context_device):
     return result
 
 
-def _pack_cpu(values, means, stds, steps):
-    return encode_gaussian(*[a.detach().cpu().numpy().reshape(-1) for a in (values, means, stds, steps)])
+def _pack_cpu(symbols, means, stds, steps):
+    return encode_gaussian_symbols(*[a.detach().cpu().numpy().reshape(-1)
+                                     for a in (symbols, means, stds, steps)])
+
+
+def _quantized_symbols(values, steps):
+    # Use the model's inference dtype/device, before the CPU coder promotes CDF
+    # parameters to FP64. Slicing a stream must never make this decision again.
+    rounded = torch.round(values/steps)
+    if (not torch.isfinite(rounded).all()
+            or (rounded < -(2**63)).any() or (rounded >= 2**63).any()):
+        raise ValueError('Nonfinite or out-of-range quantized symbols')
+    return rounded.to(torch.int64)
+
+
+def _attribute_contexts(model, xyz):
+    """Only attributes actually quantized by this model get arithmetic streams."""
+    prior = model.prior(xyz)
+    if model.config.geometry_mode == 'explicit':
+        mf, sf, qf = prior
+        return {'features': (mf, sf, qf)}
+    mf, sf, ms, ss, qf, qs = prior
+    return {'features': (mf, sf, qf), 'scales': (ms, ss, qs)}
 
 
 @torch.no_grad()
@@ -83,10 +124,15 @@ def encode_model(model, output, codec='cpu', chunk_splats=2048):
     started = time.perf_counter()
     print(f'[Encode] {len(model.xyz):,} splats, codec={codec}, output={output}', flush=True)
     context_device = 'cpu' if codec == 'cpu' else str(model.xyz.device)
+    if (model.config.appearance_backend == 'tcnn'
+            or model.config.octree_backend == 'tcnn'):
+        if not model.xyz.is_cuda:
+            raise ValueError('tiny-cuda-nn networks/contexts require a CUDA model')
+        context_device = str(model.xyz.device)
     if codec == 'cuda' and not model.xyz.is_cuda:
         raise ValueError('HAC CUDA arithmetic coding requires a CUDA model')
-    predictor = _canonical_model(model, context_device)
     files, binary = _network_files(model)
+    predictor = _canonical_model(model, context_device)
     octree, order = encode_octree(model.cells.cpu().numpy(), model.config.octree_depth)
     files['coordinates.oct'] = octree
     order = torch.as_tensor(order.astype(np.int64), device=model.xyz.device)
@@ -95,44 +141,59 @@ def encode_model(model, output, codec='cpu', chunk_splats=2048):
     xyz = predictor.bounds_min+(cells.to(torch.float32)+0.5)*(
         predictor.bounds_max-predictor.bounds_min).clamp_min(1e-6)/(1 << model.config.octree_depth)
     features = model.features[order].to(context_device)
-    scales = model.log_scales[order].exp().to(context_device)
+    attributes = {'features': features}
+    if model.config.geometry_mode == 'explicit':
+        # Step-one geometry has no lossy quantization or learned rate model.
+        # Save raw FP32 log scales/quaternions in exactly the octree order.
+        for name in ('log_scales', 'rotations'):
+            value = getattr(model, name)[order].detach().cpu().numpy()
+            if not np.isfinite(value).all():
+                raise ValueError(f'Nonfinite explicit geometry: {name}')
+            if name == 'log_scales':
+                physical = torch.from_numpy(value).exp()
+                if not torch.isfinite(physical).all() or not (physical > 0).all():
+                    raise ValueError('Explicit geometry requires finite positive scales')
+            buffer = io.BytesIO()
+            np.save(buffer, value.astype('<f4'), allow_pickle=False)
+            files[f'geometry/{name}.npy'] = buffer.getvalue()
+    else:
+        attributes['scales'] = model.log_scales[order].exp().to(context_device)
     # Use the same complete-scene batch as checkpoint inference. Re-evaluating
     # the entropy MLP on adaptive stream chunks changes floating-point GEMM
     # results slightly; near half-integers this can change quantized symbols.
     # Chunking below controls arithmetic-stream memory, not the learned context.
-    contexts = predictor.prior(xyz)
+    contexts = _attribute_contexts(predictor, xyz)
     chunks = []
     hac = _hac() if codec == 'cuda' else None
     with tempfile.TemporaryDirectory(prefix='smolgs-codec-') as temporary:
-        def pack(start, end):
-            mf, sf, ms, ss, qf, qs = (value[start:end] for value in contexts)
-            f, s = features[start:end], scales[start:end]
-            qf, qs = qf.expand_as(f).contiguous(), qs.expand_as(s).contiguous()
+        def pack(start, end, symbols):
             # HAC uses signed int16 symbols and a dense [N,alphabet] CDF.
-            spans = [int((v/q).round().max()-(v/q).round().min())+1 for v, q in ((f, qf), (s, qs))]
+            spans = {name: int(value.max())-int(value.min())+1 for name, value in symbols.items()}
             limit = 32767 if codec == 'cuda' else (1 << 20)-1
-            if max(spans) > limit or (codec == 'cuda' and max((end-start)*model.config.feature_dim*spans[0],
-                                                                           (end-start)*3*spans[1]) > 4_000_000):
+            if max(spans.values()) > limit or (codec == 'cuda' and max(
+                    symbols[name].numel()*span for name, span in spans.items()) > 4_000_000):
                 if end-start > 1:
                     middle = (start+end)//2
-                    pack(start, middle)
-                    pack(middle, end)
+                    offset = middle-start
+                    pack(start, middle, {name: value[:offset] for name, value in symbols.items()})
+                    pack(middle, end, {name: value[offset:] for name, value in symbols.items()})
                     return
                 # A single splat can still span too many quantized symbols across
                 # its channels. Split that attribute into smaller HAC streams;
                 # retain the exact quantization and count every stream in size.
             index = len(chunks)
             chunk = {'start': start, 'end': end}
-            for label, values, means, stds, steps in [('features', f, mf, sf, qf), ('scales', s, ms, ss, qs)]:
+            for label, source in attributes.items():
+                values = source[start:end]
+                means, stds, steps = (value[start:end] for value in contexts[label])
+                steps = steps.expand_as(values).contiguous()
+                integers = symbols[label]
                 name = f'{label}/{index:06d}.bin'
-                symbols = torch.round(values/steps).to(torch.int64).cpu().numpy().astype('<i8')
-                chunk[label+'_sha256'] = hashlib.sha256(symbols.tobytes()).hexdigest()
-                flat = [value.reshape(-1).contiguous() for value in (values, means, stds, steps)]
+                flat = [value.reshape(-1).contiguous() for value in (integers, values, means, stds, steps)]
                 parts = []
                 def pack_attribute(first, last):
-                    v, m, sd, q = [value[first:last].contiguous() for value in flat]
-                    integers = torch.round(v/q)
-                    span = int(integers.max()-integers.min())+1
+                    k, v, m, sd, q = [value[first:last].contiguous() for value in flat]
+                    span = int(k.max())-int(k.min())+1
                     if span > limit or (codec == 'cuda' and (last-first)*span > 4_000_000):
                         if last-first == 1:
                             raise ValueError('Nonfinite or unsupported scalar quantization range')
@@ -142,7 +203,7 @@ def encode_model(model, output, codec='cpu', chunk_splats=2048):
                         return
                     filename = name if first == 0 and last == values.numel() else f'{label}/{index:06d}_{len(parts):03d}.bin'
                     if codec == 'cpu':
-                        files[filename] = _pack_cpu(v, m, sd, q)
+                        files[filename] = _pack_cpu(k, m, sd, q)
                     else:
                         path = str(Path(temporary)/'stream.b')
                         hac.encoder_gaussian(v, m, sd, q, path)
@@ -153,14 +214,20 @@ def encode_model(model, output, codec='cpu', chunk_splats=2048):
             chunks.append(chunk)
         for start in range(0, len(xyz), chunk_splats):
             end = min(start+chunk_splats, len(xyz))
-            pack(start, end)
+            pack(start, end, {name: _quantized_symbols(value[start:end], contexts[name][2][start:end])
+                              for name, value in attributes.items()})
             if start//chunk_splats % 20 == 0 or end == len(xyz):
                 print(f'[Encode] {end:,}/{len(xyz):,} splats ({100*end/len(xyz):.1f}%)', flush=True)
-    segmented = sum(isinstance(chunk[label], list) for chunk in chunks for label in ('features', 'scales'))
-    metadata = {'format': 'smolgs-archive-v3', 'context_layout': 'full-scene-v1',
+    segmented = sum(isinstance(chunk[label], list) for chunk in chunks for label in attributes)
+    archive_format = ('smolgs-archive-v7-explicit' if model.config.geometry_mode == 'explicit'
+                      else 'smolgs-archive-v6')
+    metadata = {'format': archive_format, 'geometry_mode': model.config.geometry_mode,
+                'geometry_storage': 'lossless-fp32' if model.config.geometry_mode == 'explicit' else 'scalar-controller',
+                'hash_model': 'hac-binary-mixed-detached-v1',
+                'context_layout': 'full-scene-v1',
                 'implementation': 'independent-paper-reproduction',
-                'codec': codec, 'context_device': 'cpu' if codec == 'cpu' else 'cuda',
-                'config': model.config.to_dict(), 'count': len(xyz), 'binary_hash': binary,
+                'codec': codec, 'context_device': 'cuda' if str(context_device).startswith('cuda') else 'cpu',
+                'config': predictor.config.to_dict(), 'count': len(xyz), 'binary_hash': binary,
                 'bounds_min': model.bounds_min.tolist(), 'bounds_max': model.bounds_max.tolist(),
                 'hash_min': model.hash_min.tolist(), 'hash_max': model.hash_max.tolist(),
                 'chunks': chunks, 'files_sha256': {name: hashlib.sha256(data).hexdigest() for name, data in files.items()}}
@@ -175,7 +242,8 @@ def encode_model(model, output, codec='cpu', chunk_splats=2048):
     report = {'archive': str(output.resolve()), 'splats': len(xyz),
               'bytes': output.stat().st_size, 'size_MB': output.stat().st_size/1e6,
               'size_MiB': output.stat().st_size/2**20, 'encode_seconds': time.perf_counter()-started,
-              'codec': codec, 'segmented_attributes': segmented, 'components_raw_bytes': {name: len(data) for name, data in files.items()}}
+              'codec': codec, 'hash_model': 'hac-binary-mixed-detached-v1', 'segmented_attributes': segmented, 'components_raw_bytes': {name: len(data) for name, data in files.items()}}
+    report.update(geometry_mode=metadata['geometry_mode'], geometry_storage=metadata['geometry_storage'])
     return report
 
 
@@ -184,23 +252,40 @@ def decode_model(path, device='cpu'):
     started = time.perf_counter()
     with zipfile.ZipFile(path) as archive:
         meta = json.loads(archive.read('metadata.json'))
-        if meta.get('format') not in ('smolgs-archive-v1', 'smolgs-archive-v2', 'smolgs-archive-v3'):
-            raise ValueError('Unsupported archive format')
-        if meta['format'] == 'smolgs-archive-v3' and meta.get('context_layout') != 'full-scene-v1':
-            raise ValueError('Unsupported archive context layout')
+        if meta.get('format') not in ('smolgs-archive-v6', 'smolgs-archive-v7-explicit'):
+            raise ValueError('Unsupported archive format; expected v6 neural or v7-explicit')
+        if meta.get('hash_model') != 'hac-binary-mixed-detached-v1' or meta.get('context_layout') != 'full-scene-v1':
+            raise ValueError('Unsupported hash model or context layout')
         files = {name: archive.read(name) for name in meta['files_sha256']}
     for name, data in files.items():
         if hashlib.sha256(data).hexdigest() != meta['files_sha256'][name]:
             raise ValueError(f'Archive checksum mismatch: {name}')
-    config = Config(**meta['config'])
-    context_device = 'cpu' if meta['codec'] == 'cpu' else device
+    config = Config.from_saved(meta['config'])
+    expected_mode = 'explicit' if meta['format'] == 'smolgs-archive-v7-explicit' else 'neural'
+    if config.geometry_mode != expected_mode or meta.get('geometry_mode', 'neural') != expected_mode:
+        raise ValueError('Archive geometry mode/format mismatch')
+    if expected_mode == 'explicit' and meta.get('geometry_storage') != 'lossless-fp32':
+        raise ValueError('Unsupported explicit geometry storage')
+    context_device = 'cpu' if meta['context_device'] == 'cpu' else device
+    if meta['context_device'] == 'cuda' and not str(device).startswith('cuda'):
+        raise ValueError('This archive requires --device cuda for its native networks/contexts')
     if meta['codec'] == 'cuda' and not str(device).startswith('cuda'):
-        raise ValueError('This archive uses HAC CUDA arithmetic coding; decode with --device cuda')
-    config.hash_backend = 'torch' if context_device == 'cpu' else 'cuda'
+        raise ValueError('CUDA arithmetic coding requires --device cuda')
+    if context_device == 'cpu':
+        config.hash_backend = 'torch'
     model = SmolGS(config, meta['count'], context_device)
     weights = load_torch(io.BytesIO(files['networks.pt']))
+    expected_tables = {name: value for name, value in model.state_dict().items()
+                       if name.startswith('hash_encoder.') and name.endswith('.table')}
+    if set(meta['binary_hash']) != set(expected_tables):
+        raise ValueError('Binary hash table set mismatch')
     for name, info in meta['binary_hash'].items():
-        bits = np.unpackbits(np.frombuffer(files[info['file']], dtype=np.uint8), bitorder='little')[:info['count']]
+        if info['shape'] != list(expected_tables[name].shape) or info['count'] != expected_tables[name].numel():
+            raise ValueError('Binary hash table shape mismatch')
+        data = files[info['file']]
+        if len(data) != (info['count']+7)//8:
+            raise ValueError('Binary hash payload length mismatch')
+        bits = np.unpackbits(np.frombuffer(data, dtype=np.uint8), bitorder='little')[:info['count']]
         weights[name] = torch.from_numpy((bits.astype(np.float32)*2-1).reshape(info['shape']))
     model.load_state_dict(weights, strict=False)
     for name in ('bounds_min', 'bounds_max', 'hash_min', 'hash_max'):
@@ -211,10 +296,17 @@ def decode_model(path, device='cpu'):
     model.cells = torch.as_tensor(cells, device=context_device)
     model.xyz.copy_(model.bounds_min+(model.cells.to(torch.float32)+0.5)*(
         model.bounds_max-model.bounds_min).clamp_min(1e-6)/(1 << depth))
+    if config.geometry_mode == 'explicit':
+        for name, width in (('log_scales', 3), ('rotations', 4)):
+            value = np.load(io.BytesIO(files[f'geometry/{name}.npy']), allow_pickle=False)
+            if value.shape != (meta['count'], width) or value.dtype != np.dtype('<f4') or not np.isfinite(value).all():
+                raise ValueError(f'Invalid explicit geometry payload: {name}')
+            tensor = torch.as_tensor(value, device=context_device)
+            if name == 'log_scales' and (not torch.isfinite(tensor.exp()).all() or not (tensor.exp() > 0).all()):
+                raise ValueError('Explicit geometry requires finite positive scales')
+            getattr(model, name).copy_(tensor)
     model.eval()
-    # v1/v2 contexts were computed separately for each adaptive chunk. Preserve
-    # that convention when decoding existing archives, including their CDFs.
-    contexts = model.prior(model.xyz) if meta['format'] == 'smolgs-archive-v3' else None
+    contexts = _attribute_contexts(model, model.xyz)
     hac = _hac() if meta['codec'] == 'cuda' else None
     expected_start = 0
     with tempfile.TemporaryDirectory(prefix='smolgs-decode-') as temporary:
@@ -223,10 +315,9 @@ def decode_model(path, device='cpu'):
             if start != expected_start or not start < end <= meta['count']:
                 raise ValueError('Noncontiguous attribute chunks')
             expected_start = end
-            mf, sf, ms, ss, qf, qs = ((value[start:end] for value in contexts) if contexts is not None
-                                     else model.prior(model.xyz[start:end]))
-            qf, qs = qf.expand_as(mf).contiguous(), qs.expand_as(ms).contiguous()
-            for label, means, stds, steps in [('features', mf, sf, qf), ('scales', ms, ss, qs)]:
+            for label, context in contexts.items():
+                means, stds, steps = (value[start:end] for value in context)
+                steps = steps.expand_as(means).contiguous()
                 description = chunk[label]
                 parts = ([{'start': 0, 'end': means.numel(), 'file': description}]
                          if isinstance(description, str) else description)
@@ -241,8 +332,8 @@ def decode_model(path, device='cpu'):
                     m, sd, q = [a[first:last].contiguous() for a in flattened]
                     data = files[part['file']]
                     if meta['codec'] == 'cpu':
-                        decoded = decode_gaussian(data, *[a.cpu().numpy() for a in (m, sd, q)])
-                        decoded = torch.as_tensor(decoded, device=context_device)
+                        symbols = decode_gaussian_symbols(data, *[a.cpu().numpy() for a in (m, sd, q)])
+                        decoded = torch.as_tensor(symbols, device=q.device, dtype=q.dtype)*q
                     else:
                         filename = Path(temporary)/'stream.b'
                         filename.write_bytes(data)
@@ -250,9 +341,6 @@ def decode_model(path, device='cpu'):
                     values.reshape(-1)[first:last].copy_(decoded)
                 if cursor != means.numel():
                     raise ValueError('Missing attribute segments')
-                symbols = torch.round(values/steps).to(torch.int64).cpu().numpy().astype('<i8')
-                if hashlib.sha256(symbols.tobytes()).hexdigest() != chunk[label+'_sha256']:
-                    raise ValueError(f'Arithmetic roundtrip failed for {label}, chunk {start}:{end}')
                 if label == 'features':
                     model.features[start:end].copy_(values)
                 else:
@@ -265,4 +353,6 @@ def decode_model(path, device='cpu'):
     model.to(device)
     model.config.hash_backend = meta['config']['hash_backend']
     return model, {'decode_seconds': time.perf_counter()-started, 'splats': len(model.xyz),
-                   'size_MB': Path(path).stat().st_size/1e6, 'codec': meta['codec']}
+                   'size_MB': Path(path).stat().st_size/1e6, 'codec': meta['codec'],
+                   'geometry_mode': config.geometry_mode,
+                   'geometry_storage': meta.get('geometry_storage', 'scalar-controller')}

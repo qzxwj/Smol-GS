@@ -51,12 +51,23 @@ def _boundary(symbol, minimum, maximum, mean, std, step):
     return min(TOTAL, max(0, int(p*(TOTAL-alphabet))+symbol-minimum))
 
 
-def encode_gaussian(values, means, stds, steps):
-    arrays = [np.asarray(a, dtype=np.float64).reshape(-1) for a in (values, means, stds, steps)]
-    values, means, stds, steps = np.broadcast_arrays(*arrays)
-    if not len(values) or not all(np.isfinite(a).all() for a in arrays) or (steps <= 0).any():
+def _contexts(means, stds, steps):
+    arrays = np.broadcast_arrays(*[np.asarray(a, dtype=np.float64).reshape(-1)
+                                    for a in (means, stds, steps)])
+    if (not all(np.isfinite(a).all() for a in arrays)
+            or (arrays[1] <= 0).any() or (arrays[2] <= 0).any()):
         raise ValueError("Invalid arithmetic inputs")
-    symbols = np.rint(values/steps).astype(np.int64)
+    return arrays
+
+
+def encode_gaussian_symbols(symbols, means, stds, steps):
+    """Losslessly encode caller-quantized integers; FP64 is only used for CDFs."""
+    symbols = np.asarray(symbols).reshape(-1)
+    if (not len(symbols) or symbols.dtype.kind not in 'iu'
+            or (symbols.dtype.kind == 'u' and symbols.max() > np.iinfo(np.int64).max)):
+        raise ValueError("Arithmetic symbols must be nonempty int64-compatible integers")
+    symbols = symbols.astype(np.int64, copy=False)
+    symbols, means, stds, steps = np.broadcast_arrays(symbols, *_contexts(means, stds, steps))
     minimum, maximum = int(symbols.min()), int(symbols.max())
     if maximum-minimum+1 >= TOTAL:
         raise ValueError("Arithmetic alphabet exceeds precision; reduce chunk size")
@@ -96,19 +107,19 @@ def encode_gaussian(values, means, stds, steps):
     return b'GAC1'+struct.pack('<Qqq', len(symbols), minimum, maximum)+writer.finish()
 
 
-def decode_gaussian(blob, means, stds, steps):
+def decode_gaussian_symbols(blob, means, stds, steps):
+    """Return exact int64 symbols before any floating-point reconstruction."""
     if blob[:4] != b'GAC1' or len(blob) < 29:
         raise ValueError("Invalid arithmetic stream")
     count, minimum, maximum = struct.unpack('<Qqq', blob[4:28])
-    means, stds, steps = np.broadcast_arrays(*[np.asarray(a, dtype=np.float64).reshape(-1)
-                                               for a in (means, stds, steps)])
-    if len(means) != count or maximum-minimum+1 >= TOTAL:
+    means, stds, steps = _contexts(means, stds, steps)
+    if not count or len(means) != count or not 1 <= maximum-minimum+1 < TOTAL:
         raise ValueError("Arithmetic metadata mismatch")
     reader = BitReader(blob[28:])
     low, high, code = 0, MASK, 0
     for _ in range(32):
         code = (code << 1) | reader.read()
-    result = np.empty(count, dtype=np.float32)
+    result = np.empty(count, dtype=np.int64)
     for index, (mean, std, step) in enumerate(zip(means, stds, steps)):
         target = ((code-low+1)*TOTAL-1)//(high-low+1)
         left, right = minimum, maximum+1
@@ -140,5 +151,26 @@ def decode_gaussian(blob, means, stds, steps):
             low = (low << 1) & MASK
             high = ((high << 1) | 1) & MASK
             code = ((code << 1) & MASK) | reader.read()
-        result[index] = symbol*step
+        result[index] = symbol
     return result
+
+
+def encode_gaussian(values, means, stds, steps):
+    """Convenience wrapper; quantize in the input division dtype, then encode.
+
+    Model export uses encode_gaussian_symbols so it shares the Torch inference
+    decision instead of re-quantizing values inside this NumPy wrapper.
+    """
+    values, steps = np.broadcast_arrays(np.asarray(values).reshape(-1), np.asarray(steps).reshape(-1))
+    if not np.isfinite(values).all() or not np.isfinite(steps).all() or (steps <= 0).any():
+        raise ValueError("Invalid arithmetic inputs")
+    rounded = np.rint(values/steps)
+    if not np.isfinite(rounded).all() or (rounded < -(2**63)).any() or (rounded >= 2**63).any():
+        raise ValueError("Quantized symbols exceed int64 range")
+    return encode_gaussian_symbols(rounded.astype(np.int64), means, stds, steps)
+
+
+def decode_gaussian(blob, means, stds, steps):
+    """Convenience float reconstruction; use the symbol API for integrity checks."""
+    symbols = decode_gaussian_symbols(blob, means, stds, steps)
+    return (symbols.astype(np.float64)*np.asarray(steps, dtype=np.float64).reshape(-1)).astype(np.float32)

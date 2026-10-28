@@ -66,6 +66,8 @@ class HashGrid(nn.Module):
         self.output_dim = len(resolutions)*features
 
     def forward(self, x):
+        # Entropy context learns table weights, never the Gaussian coordinates.
+        x = x.detach()
         table = BinarySTE.apply(self.table)
         if self.backend != "torch" and x.is_cuda:
             try:
@@ -81,7 +83,9 @@ class HashGrid(nn.Module):
         outputs = []
         primes = (1, 2654435761, 805459861)
         for level, (resolution, size) in enumerate(zip(self.resolution_values, self.sizes)):
-            p = safe_x*(resolution-2)+0.5
+            # HAC CUDA fuses multiply/add. Emulate its single FP32 rounding
+            # in the reference path, including at high grid resolutions.
+            p = (safe_x.double()*(resolution-2)+0.5).to(safe_x.dtype)
             base = p.floor().long()
             frac = p-base
             out = table.new_zeros(x.shape[0], table.shape[1])
@@ -114,5 +118,6 @@ class MixedHashEncoder(nn.Module):
         self.output_dim = self.xyz.output_dim + self.xy.output_dim*3
 
     def forward(self, x):
+        x = x.detach()
         return torch.cat([self.xyz(x), self.xy(x[:, [0, 1]]),
                           self.xz(x[:, [0, 2]]), self.yz(x[:, [1, 2]])], dim=-1)

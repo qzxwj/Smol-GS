@@ -20,7 +20,7 @@ def main():
     args = parser.parse_args()
     torch.set_num_threads(8)
     assert torch.cuda.is_available(), 'CUDA is required for the benchmark'
-    for module in ('diff_gaussian_rasterization', 'simple_knn._C', '_gridencoder', 'arithmetic'):
+    for module in ('diff_gaussian_rasterization', 'simple_knn._C', '_gridencoder', 'tinycudann', 'arithmetic'):
         importlib.import_module(module)
     lpips = LPIPS('cuda')
     image = torch.zeros(3, 64, 64, device='cuda')
