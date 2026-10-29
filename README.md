@@ -1,6 +1,6 @@
 # Smol-GS
 
-按随仓库提供的 [Smol-GS 论文](paper/arxiv.tex) 独立实现的训练、渲染和压缩流程。当前实现边界见 [FIDELITY.md](docs/FIDELITY.md)。公开参考 CSV 位于 `results/` 和 `official_snapshot/`，不代表本实现的实测结果。
+按随仓库提供的 [Smol-GS 论文](paper/arxiv.tex) 独立实现的训练、渲染和压缩流程。当前实现边界见 [FIDELITY.md](docs/FIDELITY.md)。公开参考 CSV 位于 `official_snapshot/results/`，不代表本实现的实测结果。
 
 ## 目录
 
@@ -41,13 +41,18 @@ SMOLGS_PYTHON=python bash scripts/install_tcnn.sh
 | 配置 | 用途 |
 |---|---|
 | `configs/base.json` | Torch MLP 基础配置，位置 MLP 学习率 0.008 |
-| `configs/small.json` | 更强 opacity 正则，其他基础设置相同 |
-| `configs/large.json` | 更弱 opacity 正则，其他基础设置相同 |
+| `configs/small.json` | 保留配置名；当前关闭 opacity 正则，与基础设置相同 |
+| `configs/large.json` | 保留配置名；当前关闭 opacity 正则，与基础设置相同 |
 | `configs/native.json` | 原生外观和位置 MLP，位置 MLP 学习率 0.001 |
 | `configs/smoke.json` | 缩短为 50 步的五阶段流程检查 |
-| `configs/explicit.json` | 第一步实验：Torch 外观网络＋显式尺度/旋转，无几何量化 |
+| `configs/explicit.json` | 显式几何配置；所有配置默认均使用显式尺度/旋转 |
+| `configs/ecvq.json` | 显式几何＋尺度/旋转 ECVQ，支持独立编解码 |
 
 所有配置使用论文的 `abs(tanh(raw))` opacity，默认坐标八叉树深度为 16。没有额外的 MLP 学习率暖启动。原生配置保留当前选择的 0.001 位置学习率，属于明确的论文差异。
+
+当前训练代码已删除透明度正则项及其配置/命令行入口，图像重建仍正常优化透明度，
+低透明度/不可见剪枝保持不变。旧配置中的该字段不再接受；旧格式检查点和压缩包不再兼容。
+历史实验快照保留原行为，策略差异见 [FIDELITY.md](docs/FIDELITY.md)。
 
 ## 单场景训练
 
@@ -61,17 +66,26 @@ python train.py -s ../data/tandt/train -i images -r 1 \
 
 Torch 基础配置使用 `--config configs/base.json`。正常训练不设初始点数或最终点数上限。阶段边界为 500、15000、20000、30000、35000 步。
 
-显式几何实验可使用 `--config configs/explicit.json`，或在原生配置命令上加
-`--geometry-mode explicit`。它直接训练 `exp(log_scales)` 和每点原始 wxyz 四元数，
-渲染前归一化四元数，移除尺度和旋转 MLP。尺度沿用 SfM 邻近距离初始化，旋转从
-`(1,0,0,0)` 开始。默认固定学习率分别为 0.005、0.001，可用
-`--explicit-scaling-lr`、`--explicit-rotation-lr` 调整；原配置中的
-`log_scales`、`scale_mlp`、`rotation_mlp` 学习率不用于该模式。
+所有配置统一使用显式几何：每点直接训练 `log_scales` 和原始 wxyz 四元数，
+尺度为 `exp(log_scales)`，四元数在渲染前归一化。尺度按 SfM 邻近距离初始化，
+旋转从 `(1,0,0,0)` 开始。固定学习率默认分别为 0.005、0.001，可用
+`--explicit-scaling-lr`、`--explicit-rotation-lr` 调整。
+网络预测尺度和旋转的路径、对应网络及学习率入口已删除。
 实际优化器学习率配置记录在 `run.json` 的 `effective_learning_rates`。
 
-该实验只保留特征的量化和 Gaussian 码率项，不对尺度或旋转量化，不启用 VQ/ECVQ。
-增密、剪枝、坐标冻结和外观训练继续按原阶段执行。首次训练需要新输出目录，
-不能通过续训把 neural 检查点转为 explicit。
+坐标冻结时默认保留同格首点。实验选项 `--coordinate-selection opacity` 按全部训练视角的
+可见 opacity 均值选择代表点；评分定义与严格对照方法见 [COORDINATE_SELECTION.md](docs/COORDINATE_SELECTION.md)。
+
+默认只对特征执行标量量化和 Gaussian 码率优化；几何以 FP32 无损保存。
+启用 ECVQ 后再压缩尺度和旋转。增密、剪枝、坐标冻结和外观训练保持五阶段调度。
+已移除模式的配置和模型不再兼容，重新训练应使用新输出目录。
+
+ECVQ 使用 `--config configs/ecvq.json`。原生网络可在
+`--config configs/native.json` 后添加
+`--geometry-quantization ecvq`。
+默认在 20001 步初始化两个几何码本并开启 VQ，在 25001 步开启包含码率的分配，
+其余阶段沿用 Smol-GS。完成训练后生成包含几何索引流的独立压缩包。
+参考来源、参数和所有适配见 [ECVQ.md](docs/ECVQ.md)。
 
 当前格式检查点可保留 Adam 与随机数状态续训：
 
@@ -109,10 +123,23 @@ python scripts/verify_roundtrip.py \
 
 压缩包包含坐标八叉树、属性算术流、网络、二值哈希表和元数据。Size 以整个 ZIP 的实际字节数除以 1,000,000 计算 MB。原生 MLP 始终需要 CUDA；Torch MLP 支持 CPU 参考编解码。
 
-显式几何使用 `smolgs-checkpoint-v4-explicit` 和 `smolgs-archive-v7-explicit`，
+当前实现统一使用 `smolgs-checkpoint-v6` 和 `smolgs-archive-v10`。
+显式几何未启用 ECVQ 时，
 尺度的 log 参数和原始四元数以 FP32 无损保存，并与坐标八叉树顺序对齐。
 此时总包大小包含未量化几何，不能当作已经实现 ECVQ 的压缩结果。
-默认 neural 模式继续使用原有 v3 检查点和 v6 压缩包。
+坐标编码统一使用独立网格，`coordinate_depth` 默认为 16，必须在 1–20 之间。
+不提供旧检查点、旧压缩包或零深度坐标路径的兼容与迁移。
+
+ECVQ 通过统一格式中的配置和几何存储元数据标识。几何码本先裁掉未使用项，
+索引使用 RDO 的 16 位 rANS，整数 CDF 随包保存。安装其 CPU 扩展：
+
+```bash
+python -m pip install --no-build-isolation --no-deps ./submodules/rdo-entropy
+```
+
+当前环境已安装；完整扩展构建脚本也包含此项。原有 compress.py、render.py 和
+scripts/verify_roundtrip.py 支持 ECVQ 包。解码模型直接查表恢复几何，只用于推理；
+续训使用原始训练检查点。
 
 ## 批量运行与验证
 

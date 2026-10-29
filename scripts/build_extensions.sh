@@ -11,6 +11,6 @@ if [[ -n "$SMOLGS_CUDA_INCLUDES" ]]; then
 fi
 # On machines without accessible devices, explicitly set the target architecture,
 # e.g. TORCH_CUDA_ARCH_LIST=8.9 for RTX 4090. Do not change the shared CUDA install.
-for smolgs_extension in diff-gaussian-rasterization simple-knn gridencoder arithmetic; do
+for smolgs_extension in diff-gaussian-rasterization simple-knn gridencoder arithmetic rdo-entropy; do
     "$SMOLGS_PYTHON" -m pip install --no-build-isolation --no-deps "$SMOLGS_ROOT/submodules/$smolgs_extension"
 done

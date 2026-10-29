@@ -72,42 +72,30 @@ class ExplicitGeometryTests(unittest.TestCase):
         parameters = [p for g in optimizer.param_groups for p in g['params']]
         self.assertEqual(len(parameters), len(set(parameters)))
         self.assertEqual(set(parameters), set(model.parameters()))
-        for changes in ({'geometry_mode': 'bad'}, {'explicit_rotation_lr': 0}, {'explicit_scaling_lr': float('nan')}):
+        for changes in ({'geometry_mode': 'bad'}, {'geometry_mode': 'neural'}, {'explicit_rotation_lr': 0}, {'explicit_scaling_lr': float('nan')}):
             with self.assertRaises(ValueError):
                 tiny_config(**changes)
 
-    def test_initialization_preserves_unchanged_weights_and_rng(self):
+    def test_default_geometry_and_initialization_have_no_geometry_networks(self):
         for appearance, octree, device in [('torch', 'torch', 'cpu')]+(
                 [('tcnn', 'tcnn', 'cuda')] if torch.cuda.is_available() else []):
             with self.subTest(appearance=appearance):
                 options = dict(appearance_backend=appearance, octree_backend=octree,
                                octree_mlp_width=64 if octree == 'tcnn' else 8)
                 torch.manual_seed(19)
-                neural = SmolGS(tiny_config(**options), device=device)
-                cpu_rng = torch.get_rng_state().clone()
-                cuda_rng = torch.cuda.get_rng_state().clone() if device == 'cuda' else None
+                default = SmolGS(tiny_config(**options), device=device)
                 torch.manual_seed(19)
-                explicit = SmolGS(tiny_config(geometry_mode='explicit', **options), device=device)
-                self.assertTrue(torch.equal(cpu_rng, torch.get_rng_state()))
-                if cuda_rng is not None:
-                    self.assertTrue(torch.equal(cuda_rng, torch.cuda.get_rng_state()))
-                self.assertFalse(hasattr(explicit, 'rotation_mlp'))
-                self.assertFalse(hasattr(explicit, 'scale_mlp'))
-                self.assertEqual(explicit.entropy_mlp[-1].out_features, 2*explicit.config.feature_dim+1)
-                for name, value in explicit.state_dict().items():
-                    if name == 'rotations' or name.startswith('entropy_mlp.4.'):
-                        continue
-                    torch.testing.assert_close(value, neural.state_dict()[name], rtol=0, atol=0)
-                rows = list(range(2*explicit.config.feature_dim))+[2*explicit.config.feature_dim+6]
-                for name in ('weight', 'bias'):
-                    torch.testing.assert_close(getattr(explicit.entropy_mlp[-1], name),
-                                               getattr(neural.entropy_mlp[-1], name)[rows], rtol=0, atol=0)
+                repeated = SmolGS(tiny_config(**options), device=device)
+                self.assertEqual(default.config.geometry_mode, 'explicit')
+                self.assertFalse(hasattr(default, 'rotation_mlp'))
+                self.assertFalse(hasattr(default, 'scale_mlp'))
+                self.assertEqual(default.entropy_mlp[-1].out_features, 2*default.config.feature_dim+1)
+                for name, value in default.state_dict().items():
+                    torch.testing.assert_close(value, repeated.state_dict()[name], rtol=0, atol=0)
                 points = torch.tensor([[0., 0., 2.], [.1, 0., 2.], [0., .2, 2.], [.3, .2, 2.]], device=device)
-                torch.manual_seed(44); neural.initialize(points)
-                torch.manual_seed(44); explicit.initialize(points)
-                torch.testing.assert_close(neural.features, explicit.features, rtol=0, atol=0)
-                torch.testing.assert_close(neural.log_scales, explicit.log_scales, rtol=0, atol=0)
-                torch.testing.assert_close(explicit.rotations, points.new_tensor([1., 0., 0., 0.]).expand(4, 4))
+                default.initialize(points)
+                torch.testing.assert_close(default.rotations, points.new_tensor([1., 0., 0., 0.]).expand(4, 4))
+                torch.testing.assert_close(default.attributes(points.new_zeros(3), 1)['scales'], default.log_scales.exp())
 
     def test_geometry_is_view_feature_stage_and_noise_independent(self):
         for device in self.devices():
@@ -242,7 +230,7 @@ class ExplicitGeometryTests(unittest.TestCase):
 
     def test_coordinate_freeze_reorders_and_deduplicates_geometry_and_moments(self):
         for device in self.devices():
-            model = self.model(device, octree_depth=3)
+            model = self.model(device, octree_depth=3, coordinate_depth=3)
             with torch.no_grad():
                 model.xyz.copy_(model.xyz.new_tensor([[1., 0., 2.], [0., 0., 2.], [2., 1., 3.], [1., 0., 2.]]*3))
                 model.rotations.copy_(torch.arange(48, device=device).reshape(12, 4)+1.)
@@ -343,9 +331,9 @@ class ExplicitGeometryTests(unittest.TestCase):
             path = Path(temporary)/'checkpoint.pt'
             save_checkpoint(path, model, model.make_optimizer(), 4)
             payload = torch.load(path, weights_only=False)
-            payload['format'] = 'smolgs-checkpoint-v3'
+            payload['geometry_mode'] = 'neural'
             torch.save(payload, path)
-            with self.assertRaisesRegex(ValueError, 'geometry mode/format mismatch'):
+            with self.assertRaisesRegex(ValueError, 'geometry mode/config mismatch'):
                 load_checkpoint(path, resume=True)
             model.freeze_coordinates()
             path = Path(temporary)/'model.zip'
@@ -353,11 +341,11 @@ class ExplicitGeometryTests(unittest.TestCase):
             with zipfile.ZipFile(path) as archive:
                 files = {name: archive.read(name) for name in archive.namelist()}
             meta = json.loads(files['metadata.json'])
-            meta['format'] = 'smolgs-archive-v6'
+            meta['geometry_mode'] = 'neural'
             files['metadata.json'] = json.dumps(meta).encode()
             with zipfile.ZipFile(path, 'w') as archive:
                 for name, data in files.items(): archive.writestr(name, data)
-            with self.assertRaisesRegex(ValueError, 'geometry mode/format mismatch'):
+            with self.assertRaisesRegex(ValueError, 'geometry mode/config mismatch'):
                 decode_model(path)
 
     def test_training_entrypoint_resume_and_final_export(self):

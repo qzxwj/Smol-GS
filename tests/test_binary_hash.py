@@ -119,11 +119,11 @@ class BinaryHashTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             path=Path(temporary)/'float.pt'
             torch.save({'format':'smolgs-checkpoint-v2','config':{'hash_backend':'tcnn'}},path)
-            with self.assertRaisesRegex(ValueError,'binary mixed hash requires v3'): load_checkpoint(path)
+            with self.assertRaisesRegex(ValueError,'Unsupported checkpoint format'): load_checkpoint(path)
             path=Path(temporary)/'float.zip'
             with zipfile.ZipFile(path,'w') as archive:
                 archive.writestr('metadata.json',json.dumps({'format':'smolgs-archive-v5'}))
-            with self.assertRaisesRegex(ValueError,'binary mixed hash requires v6'): decode_model(path)
+            with self.assertRaisesRegex(ValueError,'Unsupported archive format'): decode_model(path)
 
     def _roundtrip(self,backend,device,codecs):
         model=self.model(backend,device)
@@ -141,15 +141,15 @@ class BinaryHashTests(unittest.TestCase):
                     context_device='cpu' if codec=='cpu' else device
                     context=_canonical_model(reference,context_device)
                     with torch.no_grad():
-                        _,_,_,_,qf,qs=context.prior(model.xyz.to(context_device))
+                        _,_,qf=context.prior(model.xyz.to(context_device))
                         expected_f=(torch.round(model.features.to(context_device)/qf)*qf).to(device)
-                        expected_s=(torch.round(model.log_scales.exp().to(context_device)/qs)*qs).clamp_min(1e-7).to(device)
+                        expected_s=model.log_scales.exp()
                     path=Path(temporary)/(codec+'.zip')
                     encode_model(model,path,codec,chunk_splats=3)
                     with zipfile.ZipFile(path) as archive:
                         meta=json.loads(archive.read('metadata.json'))
                         weights=load_torch(io.BytesIO(archive.read('networks.pt')))
-                        self.assertEqual(meta['format'],'smolgs-archive-v6')
+                        self.assertEqual(meta['format'],'smolgs-archive-v10')
                         self.assertEqual(meta['hash_model'],'hac-binary-mixed-detached-v1')
                         self.assertEqual(len(meta['binary_hash']),4)
                         self.assertFalse(any(n.endswith('.table') for n in weights))

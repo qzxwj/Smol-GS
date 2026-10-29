@@ -1,0 +1,99 @@
+{
+  "feature_dim": 8,
+  "octree_depth": 16,
+  "octree_feature_dim": 8,
+  "mlp_width": 128,
+  "octree_mlp_width": 64,
+  "appearance_backend": "tcnn",
+  "opacity_activation": "abs_tanh",
+  "geometry_mode": "explicit",
+  "explicit_scaling_lr": 0.005,
+  "explicit_rotation_lr": 0.001,
+  "geometry_quantization": "ecvq",
+  "vq_start_iter": 20001,
+  "rate_constrain_iter": 25001,
+  "vq_scale_cbsize": 8192,
+  "vq_rot_cbsize": 8192,
+  "vq_scale_lmbda": 4096.0,
+  "vq_rot_lmbda": 256.0,
+  "vq_cb_lr": 0.0002,
+  "vq_logits_lr": 0.002,
+  "vq_patch_size": 16384,
+  "reactivate_codeword_period": 1000,
+  "iterations": 35000,
+  "warmup_until": 500,
+  "densify_until": 15000,
+  "compact_until": 20000,
+  "feature_until": 30000,
+  "lr_max_steps": 30000,
+  "lambda_ssim": 0.2,
+  "lambda_rate": 0.0005,
+  "densify_threshold": 0.0002,
+  "prune_opacity": 0.005,
+  "adc_interval": 100,
+  "invisible_patience": 1000,
+  "adc_split_scale_ratio": 0.01,
+  "octree_backend": "tcnn",
+  "octree_init_seed": 1337,
+  "feature_init_std": 0.01,
+  "coordinate_max_collision_fraction": 0.5,
+  "feature_step": 1.0,
+  "rate_bin_half_width": 0.5,
+  "hash_backend": "cuda",
+  "hash_detach_coordinates": true,
+  "hash_features": 4,
+  "hash_log2_3d": 13,
+  "hash_log2_2d": 15,
+  "resolutions_3d": [
+    18,
+    24,
+    33,
+    44,
+    59,
+    80,
+    108,
+    148,
+    201,
+    275,
+    376,
+    514
+  ],
+  "resolutions_2d": [
+    130,
+    258,
+    514,
+    1026
+  ],
+  "learning_rates": {
+    "xyz": [
+      0.0002,
+      1e-05
+    ],
+    "features": [
+      0.0075,
+      0.0075
+    ],
+    "opacity_mlp": [
+      0.002,
+      2e-05
+    ],
+    "color_mlp": [
+      0.008,
+      5e-05
+    ],
+    "entropy_mlp": [
+      0.005,
+      1e-05
+    ],
+    "octree_mlp": [
+      0.001,
+      0.001
+    ],
+    "hash_encoder": [
+      0.005,
+      1e-05
+    ]
+  },
+  "coordinate_depth": 16,
+  "coordinate_tail_fraction": 0.001
+}

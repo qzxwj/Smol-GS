@@ -167,10 +167,8 @@ class CoreTests(unittest.TestCase):
                 with torch.no_grad():
                     model.log_scales.fill_(math.log(0.01))
                     model.log_scales[2].fill_(math.log(2.))
-                    for network in (model.scale_mlp, model.rotation_mlp):
-                        for parameter in network.parameters(): parameter.zero_()
-                    model.scale_mlp[4].bias.copy_(model.xyz.new_tensor([0., math.log(3), -math.log(3)]))
-                    model.rotation_mlp[4].bias.copy_(model.xyz.new_tensor([math.sqrt(0.5), 0., 0., math.sqrt(0.5)]))
+                    model.log_scales[2] += model.xyz.new_tensor([0.5, 0.75, 0.25]).log()
+                    model.rotations.copy_(model.xyz.new_tensor([math.sqrt(0.5), 0., 0., math.sqrt(0.5)]).expand_as(model.rotations))
                     model.grad_accum[[1, 2]] = 1.
                     model.vis_count.fill_(1.)
                     model.opacity_accum.fill_(0.5)
@@ -178,7 +176,7 @@ class CoreTests(unittest.TestCase):
                 moments = {name:{key:optimizer.state[getattr(model,name)][key].clone()
                                 for key in ('exp_avg','exp_avg_sq')} for name in originals}
                 normal = model.xyz.new_tensor([[1., 2., 3.], [-2., 1., 0.5]])
-                axes = originals['log_scales'][[2,2]].exp()*model.xyz.new_tensor([0.5,0.75,0.25])
+                axes = originals['log_scales'][[2,2]].exp()
                 local = normal*axes
                 expected_offset = torch.stack((-local[:,1],local[:,0],local[:,2]),-1)
                 with mock.patch('torch.randn_like', return_value=normal) as sample:
@@ -313,17 +311,6 @@ class CoreTests(unittest.TestCase):
                 torch.testing.assert_close(model.xyz,old,rtol=0,atol=0)
                 torch.testing.assert_close(model.vis_count,state,rtol=0,atol=0)
 
-    def test_opacity_regularization_is_only_active_during_compaction(self):
-        model=self.make_model()
-        image=torch.zeros(3,16,16)
-        for step in (2,3,8,9,12,13,18,19):
-            attrs={'opacity':torch.full((12,1),0.5,requires_grad=True),'rate':torch.tensor(0.)}
-            _,terms=loss_terms(model,{'image':image,'attributes':attrs},image,step)
-            self.assertEqual(float(terms['opacity']),6. if model.config.stage(step)=='compaction' else 0.)
-            if model.config.stage(step)=='compaction':
-                terms['opacity'].backward()
-                torch.testing.assert_close(attrs['opacity'].grad,torch.ones(12,1))
-
 
     def test_checkpoint_rejects_missing_or_incompatible_adc_policy(self):
         model = self.make_model()
@@ -421,14 +408,14 @@ class CoreTests(unittest.TestCase):
                 model = self.make_model().to(codec if codec == 'cuda' else 'cpu')
                 with torch.no_grad():
                     for parameter in model.entropy_mlp.parameters():
-                        parameter.zero_()  # Fixed steps: features=1, scales=0.001.
+                        parameter.zero_()  # Fixed feature step=1; geometry is stored losslessly.
                     model.features[0, :2] = model.features.new_tensor([-2_000_000., 2_000_000.])
                     model.log_scales[0] = model.log_scales.new_tensor([0.001, 4000., 1.]).log()
                     model.freeze_coordinates()
                     model.eval()
-                    _, _, _, _, qf, qs = model.prior(model.xyz)
+                    _, _, qf = model.prior(model.xyz)
                     expected_f = torch.round(model.features/qf)*qf
-                    expected_s = (torch.round(model.log_scales.exp()/qs)*qs).clamp_min(1e-7)
+                    expected_s = model.log_scales.exp()
                     path = Path(temporary)/'model.smolgs.zip'
                     report = encode_model(model, path, codec)
                     self.assertGreater(report['segmented_attributes'], 0)
@@ -453,9 +440,7 @@ class CoreTests(unittest.TestCase):
                     q = xyz.new_tensor(1.)
                     if n != count:
                         q = torch.nextafter(q, xyz.new_tensor(0.))
-                    return (xyz.new_zeros(n, d), xyz.new_ones(n, d),
-                            xyz.new_zeros(n, 3), xyz.new_ones(n, 3),
-                            q.expand(n, 1), xyz.new_full((n, 1), 0.001))
+                    return (xyz.new_zeros(n, d), xyz.new_ones(n, d), q.expand(n, 1))
 
                 with mock.patch.object(SmolGS, 'prior', shape_sensitive_prior):
                     for chunk_size in (3, count):

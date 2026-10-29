@@ -23,9 +23,8 @@ class CpuSymbolTests(unittest.TestCase):
     @torch.no_grad()
     def assert_archive_symbols(self, path, model):
         """Compare stored integers directly; no symbol digests in the format."""
-        mf, sf, ms, ss, qf, qs = model.prior(model.xyz)
-        attributes = [('features', model.features, mf, sf, qf),
-                      ('scales', model.log_scales.exp(), ms, ss, qs)]
+        mf, sf, qf = model.prior(model.xyz)
+        attributes = [('features', model.features, mf, sf, qf)]
         with zipfile.ZipFile(path) as archive:
             meta = json.loads(archive.read('metadata.json'))
             for chunk in meta['chunks']:
@@ -91,24 +90,23 @@ class CpuSymbolTests(unittest.TestCase):
         boundary_values = torch.cat([positive, -positive, torch.tensor([0., 0.5])])
         config = Config(hash_backend='torch', mlp_width=16, octree_mlp_width=8,
                         resolutions_3d=(4,), resolutions_2d=(4,),
-                        hash_log2_3d=5, hash_log2_2d=5, scale_step=1.)
+                        hash_log2_3d=5, hash_log2_2d=5)
         model = SmolGS(config)
         model.initialize(torch.tensor([[0., 0., 2.], [.1, .2, 2.1], [.3, .1, 2.2]]))
         with torch.no_grad():
             for parameter in model.entropy_mlp.parameters():
                 parameter.zero_()
-            # q_f = 1 + tanh(bias), q_s = scale_step * (1 + tanh(bias)).
-            model.entropy_mlp[4].bias[-2:] = q-1
+            # q_f = 1 + tanh(bias); geometry does not use scalar quantization.
+            model.entropy_mlp[4].bias[-1:] = q-1
             model.features.copy_(boundary_values.expand_as(model.features))
             model.log_scales.copy_(positive.log().expand_as(model.log_scales))
             model.freeze_coordinates()
         model.eval()
         with torch.no_grad():
-            _, _, _, _, qf, qs = model.prior(model.xyz)
+            _, _, qf = model.prior(model.xyz)
             expected_symbols = torch.round(model.features/qf).to(torch.int64)
-            expected_scale_symbols = torch.round(model.log_scales.exp()/qs).to(torch.int64)
             expected_features = expected_symbols.float()*qf
-            expected_scales = (expected_scale_symbols.float()*qs).clamp_min(1e-7)
+            expected_scales = model.log_scales.exp()
         for chunk_size in (1, 2, len(model.xyz)):
             with self.subTest(chunk_size=chunk_size), tempfile.TemporaryDirectory() as directory:
                 path = Path(directory)/'boundary.zip'

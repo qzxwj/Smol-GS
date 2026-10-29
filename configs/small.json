@@ -11,14 +11,12 @@
   "feature_until": 30000,
   "lr_max_steps": 30000,
   "lambda_ssim": 0.2,
-  "lambda_opacity": 4e-07,
   "lambda_rate": 0.0005,
   "densify_threshold": 0.0002,
   "prune_opacity": 0.005,
   "adc_interval": 100,
   "invisible_patience": 1000,
   "feature_step": 1.0,
-  "scale_step": 0.001,
   "rate_bin_half_width": 0.5,
   "hash_backend": "auto",
   "learning_rates": {
@@ -30,10 +28,6 @@
       0.0075,
       0.0075
     ],
-    "log_scales": [
-      0.01,
-      0.002
-    ],
     "opacity_mlp": [
       0.002,
       2e-05
@@ -41,14 +35,6 @@
     "color_mlp": [
       0.008,
       5e-05
-    ],
-    "rotation_mlp": [
-      0.004,
-      0.004
-    ],
-    "scale_mlp": [
-      0.004,
-      0.004
     ],
     "entropy_mlp": [
       0.005,
@@ -87,5 +73,6 @@
     258,
     514,
     1026
-  ]
+  ],
+  "geometry_mode": "explicit"
 }

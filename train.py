@@ -2,6 +2,7 @@
 """Train all five Smol-GS stages on an SfM scene."""
 from argparse import ArgumentParser
 from pathlib import Path
+import csv
 import json
 import random
 import os
@@ -16,6 +17,7 @@ from utils.loss_utils import loss_terms, psnr
 from utils.checkpoint import save_checkpoint, load_checkpoint
 from smolgs.codec import encode_model
 from smolgs.evaluation import evaluate
+from smolgs.coordinate_selection import score_training_opacity
 
 
 def parser():
@@ -45,6 +47,8 @@ def parser():
     p.add_argument('--log-interval', type=int, default=100)
     p.add_argument('--monitor-octree', action='store_true', help='Log positional MLP activity without consuming RNG')
     p.add_argument('--require-active-octree', action='store_true', help='Stop if an all-point check confirms a dead positional MLP')
+    p.add_argument('--coordinate-selection', choices=['first', 'opacity'], default=None,
+                   help='Collision representative: first point or training-view mean visible opacity')
     add_model_optimization_arguments(p)
     return p
 
@@ -87,6 +91,12 @@ def main(args=None):
         config = model.config
         if args.config_geometry_mode is not None and args.config_geometry_mode != config.geometry_mode:
             raise ValueError('Cannot change geometry mode when resuming; start a fresh run')
+        for name in ('geometry_quantization', 'vq_start_iter', 'rate_constrain_iter', 'vq_scale_cbsize',
+                     'vq_rot_cbsize', 'vq_scale_lmbda', 'vq_rot_lmbda', 'vq_cb_lr', 'vq_logits_lr',
+                     'vq_patch_size', 'reactivate_codeword_period'):
+            override = getattr(args, 'config_'+name)
+            if override is not None and override != getattr(config, name):
+                raise ValueError(f'Cannot change {name} when resuming; use the checkpoint configuration')
     else:
         config = config_from_args(args)
         points = load_points(args.source_path)
@@ -100,6 +110,11 @@ def main(args=None):
         optimizer = model.make_optimizer()
         first_step = 0
     resume_metadata = metadata if args.resume else {}
+    stored_selection = resume_metadata.get('coordinate_selection', 'first')
+    if (bool(model.coordinate_frozen) and args.coordinate_selection is not None
+            and args.coordinate_selection != stored_selection):
+        raise ValueError('Cannot change coordinate selection after coordinates are frozen')
+    args.coordinate_selection = args.coordinate_selection or stored_selection
     metadata = {**resume_metadata, 'data': {'source_path': str(Path(args.source_path).resolve()), 'images': args.images,
                         'resolution': args.resolution, 'holdout': args.holdout,
                         'white_background': args.white_background},
@@ -114,7 +129,8 @@ def main(args=None):
                 'opacity_activation': config.opacity_activation,
                 'octree_backend': config.octree_backend,
                 'geometry_mode': config.geometry_mode,
-                'geometry_quantization': 'none' if config.geometry_mode == 'explicit' else 'scalar-controller',
+                'coordinate_selection': args.coordinate_selection,
+                'geometry_quantization': config.geometry_quantization,
                 'effective_learning_rates': config.optimizer_rates(),
                 'implementation': 'independent-paper-reproduction'}
     (output/'config.json').write_text(json.dumps(config.to_dict(), indent=2)+'\n')
@@ -133,7 +149,14 @@ def main(args=None):
     started = time.perf_counter()
     stage_before = None
     model.train()
-    with (output/'training.jsonl').open('a') as log:
+    csv_path = output/'training.csv'
+    csv_has_header = csv_path.exists() and csv_path.stat().st_size > 0
+    with (output/'training.jsonl').open('a') as log, csv_path.open('a', newline='') as csv_log:
+        csv_fields = ['step', 'loss', 'psnr', 'splats', 'stage', 'view', 'elapsed_seconds']
+        csv_writer = csv.DictWriter(csv_log, fieldnames=csv_fields)
+        if not csv_has_header:
+            csv_writer.writeheader()
+            csv_log.flush()
         for step in range(first_step+1, stop+1):
             stage = config.stage(step)
             if stage != stage_before:
@@ -145,12 +168,23 @@ def main(args=None):
                     model.hash_min.copy_(model.bounds_min)
                     model.hash_max.copy_(model.bounds_max)
             if step == config.feature_until+1:
-                removed = model.freeze_coordinates(optimizer)
+                scores = None
+                if args.coordinate_selection == 'opacity' and not bool(model.coordinate_frozen):
+                    scores, seen = score_training_opacity(model, train_cameras, step-1, args.renderer)
+                    receipt = {'method': 'mean(opacity * (radii > 0)) over all training views',
+                               'step': step-1, 'train_names': [c.name for c in train_cameras],
+                               'scores': scores.cpu(), 'visible_view_counts': seen.cpu()}
+                    torch.save(receipt, output/'coordinate_opacity_scores.pt')
+                removed = model.freeze_coordinates(optimizer, scores=scores)
+                del scores
                 print(f'Quantized coordinates; removed {removed} duplicate cells', flush=True)
+            model.prepare_geometry_quantization(step)
             model.update_learning_rates(optimizer, step)
             camera = train_cameras[random.randrange(len(train_cameras))].to(args.device)
             target = camera.image(args.device)
             optimizer.zero_grad(set_to_none=True)
+            if model.optimizer_vq is not None:
+                model.optimizer_vq.zero_grad(set_to_none=True)
             package = render(model, camera, step, args.renderer)
             loss, terms = loss_terms(model, package, target, step)
             if not torch.isfinite(loss):
@@ -160,10 +194,11 @@ def main(args=None):
                 model.collect_statistics(package['attributes'], package['visible'], step,
                                          package['viewspace_points'])
             optimizer.step()
+            model.step_geometry_quantizers(step)
             # Release the raster graph before densification reallocates splat arrays.
             row = None
             if step % args.log_interval == 0 or step == stop:
-                row = {'step': step, 'stage': stage, 'loss': float(loss.detach()),
+                row = {'step': step, 'stage': stage, 'view': camera.name, 'loss': float(loss.detach()),
                        'psnr': float(psnr(package['image'].detach(), target)), 'splats': len(model.xyz),
                        **{k: float(v.detach()) for k, v in terms.items()},
                        'elapsed_seconds': time.perf_counter()-started}
@@ -178,6 +213,10 @@ def main(args=None):
                     model.refresh_bounds()
             if row:
                 row.update(model.geometry_summary())
+                if config.geometry_quantization == 'ecvq':
+                    row.update(vq_updates=int(model.vq_updates), vq_rate_constrained=bool(model.vq_rate_constrained),
+                               vq_cb_lr=model.optimizer_vq.param_groups[0]['lr'],
+                               vq_logits_lr=model.optimizer_vq.param_groups[1]['lr'])
                 if args.monitor_octree or args.require_active_octree:
                     health = model.octree_health()
                     if args.require_active_octree and health['octree_embedding_range'] == 0:
@@ -188,6 +227,8 @@ def main(args=None):
                     row.update(health)
                 log.write(json.dumps(row)+'\n')
                 log.flush()
+                csv_writer.writerow({key: row[key] for key in csv_fields})
+                csv_log.flush()
                 elapsed = row['elapsed_seconds']
                 completed = step-first_step
                 eta = elapsed/max(completed, 1)*(stop-step)

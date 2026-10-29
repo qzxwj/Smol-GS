@@ -1,0 +1,46 @@
+{
+  "source": "RDO-Gaussian/submodules/imcl-compression",
+  "changes": "rans_interface.cpp flush: output size symbols + 2 for terminal state; other C++/header files unchanged",
+  "files": [
+    {
+      "path": "submodules/rdo-entropy/cpp_exts/ops/ops.cpp",
+      "source_sha256": "124d82b314a744443bb766b1458233ee658d0e4b44c503f37d44079dc3777c07",
+      "sha256": "124d82b314a744443bb766b1458233ee658d0e4b44c503f37d44079dc3777c07"
+    },
+    {
+      "path": "submodules/rdo-entropy/cpp_exts/rans/rans_interface.cpp",
+      "source_sha256": "a7b746044d49b1fd0a0ca586582ba5c88e873b5fb1dd4f027a56098113627971",
+      "sha256": "0664a950d65207b39a0b061fac951e09043924c946e0b3e160c968b9a1737547"
+    },
+    {
+      "path": "submodules/rdo-entropy/cpp_exts/rans/rans_interface.hpp",
+      "source_sha256": "b5613c84e21763e1689fc690fe38c624a2eaadbb7d91a035141e7da868ebd05d",
+      "sha256": "b5613c84e21763e1689fc690fe38c624a2eaadbb7d91a035141e7da868ebd05d"
+    },
+    {
+      "path": "submodules/rdo-entropy/cpp_exts/ryg_rans/LICENSE",
+      "source_sha256": "9e1bc872f9f32b860104f4332d0490c0d6f4d5404d26482eedec067fc9b19f15",
+      "sha256": "9e1bc872f9f32b860104f4332d0490c0d6f4d5404d26482eedec067fc9b19f15"
+    },
+    {
+      "path": "submodules/rdo-entropy/cpp_exts/ryg_rans/README",
+      "source_sha256": "c41ce2145889510ce17f29e6a96eb6ac3d6f77b753cc35d5b093ca9ceda2b26d",
+      "sha256": "c41ce2145889510ce17f29e6a96eb6ac3d6f77b753cc35d5b093ca9ceda2b26d"
+    },
+    {
+      "path": "submodules/rdo-entropy/cpp_exts/ryg_rans/rans64.h",
+      "source_sha256": "aef84257cf7a467e7ef134beddf743a750e218b7231f23c1a02ca1ea00683717",
+      "sha256": "aef84257cf7a467e7ef134beddf743a750e218b7231f23c1a02ca1ea00683717"
+    },
+    {
+      "path": "submodules/rdo-entropy/cpp_exts/ryg_rans/rans_byte.h",
+      "source_sha256": "66e9521b4485c1b36ee7527f1a6cd7c9fe7f8495f81420602fbdc26b7273bea6",
+      "sha256": "66e9521b4485c1b36ee7527f1a6cd7c9fe7f8495f81420602fbdc26b7273bea6"
+    },
+    {
+      "path": "submodules/rdo-entropy/cpp_exts/ryg_rans/rans_word_sse41.h",
+      "source_sha256": "0b00a7a63f243412bf2cb62ba03d2aae63c6a14231cd9455bca040150d5ab73e",
+      "sha256": "0b00a7a63f243412bf2cb62ba03d2aae63c6a14231cd9455bca040150d5ab73e"
+    }
+  ]
+}

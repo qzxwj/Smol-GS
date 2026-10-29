@@ -8,7 +8,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from utils.checkpoint import load_checkpoint
-from smolgs.codec import decode_model, quantized_hash_reference
+from smolgs.codec import decode_model, export_reference
+from utils.graphics_utils import quaternion_matrix
 from scene.dataset_readers import load_scene
 from gaussian_renderer import render
 
@@ -35,9 +36,13 @@ def main():
         raise AssertionError('Splat count changed during codec roundtrip')
     checkpoint.eval()
     float_checkpoint = checkpoint
-    checkpoint = quantized_hash_reference(checkpoint)
+    checkpoint = export_reference(checkpoint, report['codec'])
     decoded.eval()
     errors = []
+    if checkpoint.config.geometry_quantization == 'ecvq':
+        for key in ('scale', 'rot'):
+            torch.testing.assert_close(getattr(checkpoint, key+'_indices'), getattr(decoded, key+'_indices'), rtol=0, atol=0)
+            torch.testing.assert_close(checkpoint.quantizers[key].codebook, decoded.quantizers[key].codebook, rtol=0, atol=0)
     with torch.no_grad():
         for camera in cameras[:args.views]:
             camera = camera.to(args.device)
@@ -53,15 +58,21 @@ def main():
                 torch.testing.assert_close(a, b, atol=2e-5, rtol=2e-5)
                 attribute_errors[name] = float((a-b).abs().max())
             before, after = before_package['image'], after_package['image']
+            def covariance(attrs):
+                factors = quaternion_matrix(attrs['rotation'])*attrs['scales'][:, None, :]
+                return factors @ factors.transpose(1, 2)
+            covariance_error = (covariance(before_package['attributes'])-covariance(after_package['attributes'])).abs()
+            torch.testing.assert_close(covariance(before_package['attributes']), covariance(after_package['attributes']), atol=2e-6, rtol=2e-5)
             difference = (before-after).abs()
             if not torch.isfinite(difference).all() or float(difference.max()) > args.image_max_abs or float(difference.mean()) > args.image_mean_abs:
                 raise AssertionError(f'Render disagreement: max={float(difference.max())}, '
                                      f'mean={float(difference.mean())}')
             errors.append({'name': camera.name, 'max_abs': float(difference.max()),
                            'mean_abs': float(difference.mean()), 'attributes_max_abs': attribute_errors,
+                           'covariance_max_abs': float(covariance_error.max()),
                            'checkpoint_to_binary_max_abs': float((original_image-before).abs().max()),
                            'checkpoint_to_binary_mean_abs': float((original_image-before).abs().mean())})
-    report.update({'checkpoint_step': step, 'render_agreement': True, 'reference': 'checkpoint with exported binary hash signs', 'views': errors,
+    report.update({'checkpoint_step': step, 'render_agreement': True, 'reference': 'actual export decisions, binary hash and codebook lookup', 'views': errors,
                    'criteria': {'attributes_atol': 2e-5, 'attributes_rtol': 2e-5,
                                 'image_max_abs': args.image_max_abs, 'image_mean_abs': args.image_mean_abs},
                    'note': 'Codec consistency check only; this does not establish paper metric reproduction.'})

@@ -31,10 +31,14 @@ def loss_terms(model, package, target, step):
     image, attrs = package['image'], package['attributes']
     l1 = (image-target).abs().mean()
     dssim = 1-ssim(image, target)
-    opacity = attrs['opacity'].sum() if config.stage(step) == 'compaction' else image.new_zeros(())
     rate = attrs['rate'] if step > config.compact_until else image.new_zeros(())
-    total = (1-config.lambda_ssim)*l1+config.lambda_ssim*dssim+config.lambda_opacity*opacity+config.lambda_rate*rate
-    return total, {'l1': l1, 'dssim': dssim, 'opacity': opacity, 'rate_bits_per_splat': rate}
+    total = (1-config.lambda_ssim)*l1+config.lambda_ssim*dssim+config.lambda_rate*rate
+    terms = {'l1': l1, 'dssim': dssim, 'rate_bits_per_splat': rate}
+    if config.geometry_quantization == 'ecvq':
+        total = total+attrs['geometry_vq_loss']+attrs['geometry_rate_loss']
+        terms.update(geometry_vq_loss=attrs['geometry_vq_loss'], geometry_rate_loss=attrs['geometry_rate_loss'],
+                     scale_bits=attrs['scale_bits'], rot_bits=attrs['rot_bits'])
+    return total, terms
 
 
 class LPIPS:

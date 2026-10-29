@@ -1,10 +1,10 @@
-"""Neural splats, entropy prior, topology updates and Adam state migration."""
+"""Explicit geometry, neural appearance, entropy prior, topology updates and Adam state migration."""
 import math
 import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
-from utils.graphics_utils import morton_codes, positional_bits, quantize_cells, quaternion_matrix
+from utils.graphics_utils import positional_bits, quantize_cells, quaternion_matrix
 from utils.hashgrid import MixedHashEncoder
 
 
@@ -50,15 +50,18 @@ class SmolGS(nn.Module):
         self.xyz = nn.Parameter(torch.zeros(count, 3))
         self.features = nn.Parameter(torch.zeros(count, config.feature_dim))
         self.log_scales = nn.Parameter(torch.zeros(count, 3))
-        if config.geometry_mode == 'explicit':
-            rotations = torch.zeros(count, 4)
-            rotations[:, 0] = 1
-            self.rotations = nn.Parameter(rotations)
+        rotations = torch.zeros(count, 4)
+        rotations[:, 0] = 1
+        self.rotations = nn.Parameter(rotations)
         self.register_buffer("bounds_min", torch.zeros(3))
         self.register_buffer("bounds_max", torch.ones(3))
         self.register_buffer("hash_min", torch.zeros(3))
         self.register_buffer("hash_max", torch.ones(3))
         self.register_buffer("cells", torch.zeros(count, 3, dtype=torch.long))
+        self.register_buffer('coordinate_cells', torch.zeros(count, 3, dtype=torch.long))
+        self.register_buffer('coordinate_regions', torch.zeros(count, dtype=torch.long))
+        self.register_buffer('coordinate_bounds_min', torch.zeros(2, 3))
+        self.register_buffer('coordinate_bounds_max', torch.ones(2, 3))
         for name in ("grad_accum", "vis_count", "opacity_accum", "last_seen"):
             self.register_buffer(name, torch.zeros(count))
         self.register_buffer("coordinate_frozen", torch.tensor(False))
@@ -70,24 +73,9 @@ class SmolGS(nn.Module):
         dim = config.feature_dim+config.octree_feature_dim+4
         self.opacity_mlp = mlp(dim, config.mlp_width, 1, nn.Tanh())
         self.color_mlp = mlp(dim, config.mlp_width, 3, nn.Sigmoid())
-        # Consume the baseline heads' RNG even in explicit mode so unchanged
-        # branches and feature initialization remain comparable at the same seed.
-        rotation_head = mlp(dim, config.mlp_width, 4)
-        scale_head = mlp(dim, config.mlp_width, 3)
-        if config.geometry_mode == 'neural':
-            self.rotation_mlp = rotation_head
-            self.scale_mlp = scale_head
         self.hash_encoder = MixedHashEncoder(config)
-        # Table A.2: 2*n_f + (3 mean_s + 3 sigma_s + 1 delta_f + 1 delta_s).
-        self.entropy_mlp = mlp(self.hash_encoder.output_dim, config.mlp_width, 2*config.feature_dim+8)
-        if config.geometry_mode == 'explicit':
-            # Retain exactly the baseline feature mean/std/step rows, without
-            # allocating another random layer or keeping any scale-prior rows.
-            head = self.entropy_mlp[-1]
-            rows = list(range(2*config.feature_dim))+[2*config.feature_dim+6]
-            head.weight = nn.Parameter(head.weight.detach()[rows].clone())
-            head.bias = nn.Parameter(head.bias.detach()[rows].clone())
-            head.out_features = len(rows)
+        # Feature mean, standard deviation and learned quantization step.
+        self.entropy_mlp = mlp(self.hash_encoder.output_dim, config.mlp_width, 2*config.feature_dim+1)
         self.to(device)
         if config.appearance_backend == 'tcnn':
             from utils.fused_mlp import FusedMLP
@@ -101,6 +89,26 @@ class SmolGS(nn.Module):
             with torch.cuda.device(device):
                 self.octree_mlp = FusedMLP(3*config.octree_depth, config.octree_mlp_width,
                     config.octree_feature_dim, seed=config.octree_init_seed)
+        self.optimizer_vq = self.scheduler_vq = None
+        if config.geometry_quantization == 'ecvq':
+            from smolgs.vq import ECVQ
+            # Random placeholders are overwritten by K-means at vq_start_iter.
+            # Keep all step-one initialization and RNG independent of this option.
+            with torch.random.fork_rng(devices=[]):
+                self.quantizers = nn.ModuleDict({
+                    'scale': ECVQ(3, config.vq_scale_cbsize, 3, config.vq_scale_lmbda, config.vq_patch_size),
+                    'rot': ECVQ(4, config.vq_rot_cbsize, 4, config.vq_rot_lmbda, config.vq_patch_size),
+                })
+            self.register_buffer('vq_updates', torch.tensor(0, dtype=torch.long))
+            self.register_buffer('vq_rate_constrained', torch.tensor(False))
+            self.register_buffer('decoded_scales', torch.empty(0, 3, device=device))
+            self.register_buffer('scale_indices', torch.empty(0, 1, dtype=torch.long, device=device))
+            self.register_buffer('rot_indices', torch.empty(0, 1, dtype=torch.long, device=device))
+            for key in ('scale', 'rot'):
+                self.register_buffer(key+'_index_cache', torch.full((count, 1), -1, dtype=torch.long, device=device))
+            self.quantizers.to(device)
+            self.vq_updates = self.vq_updates.to(device)
+            self.vq_rate_constrained = self.vq_rate_constrained.to(device)
 
     @torch.no_grad()
     def initialize(self, points):
@@ -118,17 +126,21 @@ class SmolGS(nn.Module):
         self.xyz = nn.Parameter(points)
         self.features = nn.Parameter(torch.randn(len(points), self.config.feature_dim, device=points.device)*self.config.feature_init_std)
         self.log_scales = nn.Parameter(distances.log()[:, None].repeat(1, 3))
-        if self.config.geometry_mode == 'explicit':
-            rotations = points.new_zeros(len(points), 4)
-            rotations[:, 0] = 1
-            self.rotations = nn.Parameter(rotations)
+        rotations = points.new_zeros(len(points), 4)
+        rotations[:, 0] = 1
+        self.rotations = nn.Parameter(rotations)
         self.reset_statistics(len(points))
         self.cells = torch.zeros_like(points, dtype=torch.long)
+        self.coordinate_cells = torch.zeros_like(points, dtype=torch.long)
+        self.coordinate_regions = torch.zeros(len(points), device=points.device, dtype=torch.long)
         self.refresh_bounds()
         self.hash_min.copy_(self.bounds_min)
         self.hash_max.copy_(self.bounds_max)
 
     def reset_statistics(self, count):
+        if self.config.geometry_quantization == 'ecvq':
+            for key in ('scale', 'rot'):
+                setattr(self, key+'_index_cache', torch.full((count, 1), -1, dtype=torch.long, device=self.xyz.device))
         for name in ("grad_accum", "vis_count", "opacity_accum", "last_seen"):
             setattr(self, name, self.xyz.new_zeros(count))
 
@@ -146,7 +158,7 @@ class SmolGS(nn.Module):
     def geometry_summary(self):
         return {"geometry_mode": self.config.geometry_mode,
                 "bbox_extent": (self.xyz.amax(0)-self.xyz.amin(0)).tolist(),
-                "controller_scale_max": float(self.log_scales.amax().exp()),
+                "scale_max": float(self.log_scales.amax().exp()),
                 "scene_extent": float(self.scene_extent)}
 
     @torch.no_grad()
@@ -208,15 +220,9 @@ class SmolGS(nn.Module):
         normalized = (xyz-self.hash_min)/(self.hash_max-self.hash_min).clamp_min(1e-6)
         raw = self.entropy_mlp(self.hash_encoder(normalized))
         d = self.config.feature_dim
-        if self.config.geometry_mode == 'explicit':
-            mf, sf, qf = raw.split([d, d, 1], dim=-1)
-            return (mf, F.softplus(sf)+1e-6,
-                    self.config.feature_step*(1+torch.tanh(qf)).clamp_min(1e-4))
-        mf, sf, ms, ss, qf, qs = raw.split([d, d, 3, 3, 1, 1], dim=-1)
-        # Positive Gaussian std and HAC's bounded step adjustment.
-        return (mf, F.softplus(sf)+1e-6, ms, F.softplus(ss)+1e-6,
-                self.config.feature_step*(1+torch.tanh(qf)).clamp_min(1e-4),
-                self.config.scale_step*(1+torch.tanh(qs)).clamp_min(1e-4))
+        mf, sf, qf = raw.split([d, d, 1], dim=-1)
+        return (mf, F.softplus(sf)+1e-6,
+                self.config.feature_step*(1+torch.tanh(qf)).clamp_min(1e-4))
 
     def position_inputs(self, cells):
         return positional_bits(cells,self.config.octree_depth,self.xyz.dtype)
@@ -230,20 +236,15 @@ class SmolGS(nn.Module):
         xyz = self.xyz[mask]
         features = self.features[mask]
         scales = self.log_scales[mask].exp()
+        if self.config.geometry_quantization == 'ecvq' and bool(self.decoded):
+            scales = self.decoded_scales[mask]
         rate = xyz.new_zeros(())
         compressed = step > self.config.compact_until
         if compressed and not bool(self.decoded):
-            if self.config.geometry_mode == 'explicit':
-                mf, sf, qf = self.prior(xyz)
-            else:
-                mf, sf, ms, ss, qf, qs = self.prior(xyz)
+            mf, sf, qf = self.prior(xyz)
             features = quantize(features, qf, self.training)
-            if self.config.geometry_mode == 'neural':
-                scales = quantize(scales, qs, self.training)
             if self.training and len(xyz):
                 bits = gaussian_bits(features, mf, sf, qf, self.config.rate_bin_half_width).sum(-1)
-                if self.config.geometry_mode == 'neural':
-                    bits = bits+gaussian_bits(scales, ms, ss, qs, self.config.rate_bin_half_width).sum(-1)
                 rate = bits.mean()
         if bool(self.coordinate_frozen):
             cells = self.cells[mask]
@@ -260,21 +261,92 @@ class SmolGS(nn.Module):
         else:
             opacity = self.opacity_mlp(augmented).abs()
             color = self.color_mlp(augmented)
-        if self.config.geometry_mode == 'explicit':
-            raw_rotation = self.rotations[mask]
-            # A zero quaternion does not describe a rotation. Deterministically
-            # render identity near zero, including after checkpoint loading.
-            identity = torch.zeros_like(raw_rotation)
-            identity[:, 0] = 1
-            raw_rotation = torch.where(raw_rotation.norm(dim=-1, keepdim=True) > 1e-12,
-                                       raw_rotation, identity)
-            rotation = F.normalize(raw_rotation, dim=-1)
-        else:
-            rotation = F.normalize(self.rotation_mlp(augmented), dim=-1)
-            # Noise may cross zero; physical Gaussian scales must stay positive.
-            scales = scales.clamp_min(1e-7)*torch.sigmoid(self.scale_mlp(augmented))
-        return {"xyz": xyz, "color": color, "opacity": opacity,
-                "scales": scales, "rotation": rotation, "rate": rate, "mask": mask}
+        raw_rotation = self.rotations[mask]
+        geometry = self.quantized_geometry(scales, raw_rotation, step, mask)
+        scales, raw_rotation = geometry['scales'], geometry['raw_rotation']
+        # A zero quaternion does not describe a rotation. Deterministically
+        # render identity near zero, including after checkpoint loading.
+        identity = torch.zeros_like(raw_rotation)
+        identity[:, 0] = 1
+        raw_rotation = torch.where(raw_rotation.norm(dim=-1, keepdim=True) > 1e-12,
+                                   raw_rotation, identity)
+        rotation = F.normalize(raw_rotation, dim=-1)
+        result = {"xyz": xyz, "color": color, "opacity": opacity,
+                  "scales": scales, "rotation": rotation, "rate": rate, "mask": mask}
+        result.update({key: value for key, value in geometry.items() if key not in ('scales', 'raw_rotation')})
+        return result
+
+    def quantized_geometry(self, scales, rotations, step, mask=None):
+        zero = scales.new_zeros(())
+        result = {'scales': scales, 'raw_rotation': rotations,
+                  'geometry_vq_loss': zero, 'geometry_rate_loss': zero,
+                  'scale_bits': zero, 'rot_bits': zero}
+        if self.config.geometry_quantization != 'ecvq' or step < self.config.vq_start_iter:
+            return result
+        if bool(self.decoded):
+            return result  # Materialized codewords; never reassign after shrinking.
+        # Keep RDO's geometry-to-image loss weight: its six VQ groups have
+        # 3+4+3+9+15+21 = 55 dimensions. Dropping appearance groups must not
+        # amplify the remaining geometry terms (equivalent to 7N then *7/55).
+        # N is the full scene count, including masked forwards.
+        denominator = 55*max(len(self.xyz), 1)
+        vq_error, rate_loss = zero, zero
+        indexes = {}
+        positions = torch.arange(len(self.xyz), device=self.xyz.device) if mask is None else mask
+        # RDO train.py refreshes at 20001, 20011, ...; evaluation searches afresh.
+        update_index = not self.training or (step-1) % 10 == 0
+        for key, value in (('scale', scales), ('rot', rotations)):
+            quantizer = self.quantizers[key]
+            cache = getattr(self, key+'_index_cache')
+            selected = cache[positions]
+            # A fresh run/custom VQ start or a newly created point has no cache.
+            cached = None if update_index or (selected < 0).any() else selected
+            out = quantizer(value, rate_constrain=step >= self.config.rate_constrain_iter,
+                            index_cache=cached)
+            with torch.no_grad():
+                cache[positions] = out['x_index'].detach()
+            # RDO renderer's STE: image gradients go to the original vector,
+            # while the separate norm loss trains both vectors and codewords.
+            ste = (out['x_hat']-value).detach()+value
+            result['scales' if key == 'scale' else 'raw_rotation'] = ste
+            vq_error = vq_error+torch.linalg.vector_norm(out['x_hat']-value, dim=-1).sum()
+            rate_loss = rate_loss+out['bits']/quantizer.lmbda
+            result[key+'_bits'] = out['bits']
+            indexes[key] = out['x_index']
+        result.update(geometry_vq_loss=vq_error/denominator,
+                      geometry_rate_loss=rate_loss/denominator, geometry_indices=indexes)
+        return result
+
+    @torch.no_grad()
+    def prepare_geometry_quantization(self, step):
+        if self.config.geometry_quantization != 'ecvq' or step < self.config.vq_start_iter:
+            return
+        flags = [bool(q.initialized) for q in self.quantizers.values()]
+        if any(flags) and not all(flags):
+            raise RuntimeError('Incomplete geometry codebook initialization')
+        if not any(flags):
+            if not len(self.xyz) or not torch.isfinite(self.log_scales.exp()).all() or not torch.isfinite(self.rotations).all():
+                raise ValueError('ECVQ initialization needs nonempty finite geometry')
+            self.quantizers['scale'].kmeans_initialize(self.log_scales.exp().detach())
+            self.quantizers['rot'].kmeans_initialize(self.rotations.detach())
+        self.vq_rate_constrained.fill_(step >= self.config.rate_constrain_iter)
+
+    @torch.no_grad()
+    def step_geometry_quantizers(self, step):
+        if self.config.geometry_quantization != 'ecvq' or step < self.config.vq_start_iter:
+            return
+        if self.optimizer_vq is None or self.scheduler_vq is None:
+            raise RuntimeError('Create the geometry optimizer before training')
+        if not all(bool(q.initialized) for q in self.quantizers.values()):
+            raise RuntimeError('Prepare ECVQ before updating codebooks')
+        self.optimizer_vq.step()
+        self.scheduler_vq.step()
+        self.vq_updates.add_(1)
+        # Same global-iteration condition as RDO train.py; no reactivation
+        # after rate-constrained assignment starts.
+        if step % self.config.reactivate_codeword_period == 0 and step < self.config.rate_constrain_iter:
+            for quantizer in self.quantizers.values():
+                quantizer.reactivate_codeword(prob_threshold=1e-5)
 
     def make_optimizer(self):
         groups = []
@@ -282,6 +354,12 @@ class SmolGS(nn.Module):
             value = getattr(self, name)
             params = list(value.parameters()) if isinstance(value, nn.Module) else [value]
             groups.append({"params": params, "lr": initial, "name": name})
+        if self.config.geometry_quantization == 'ecvq':
+            self.optimizer_vq = torch.optim.Adam([
+                {'params': [q.codebook for q in self.quantizers.values()], 'lr': self.config.vq_cb_lr},
+                {'params': [q.logits for q in self.quantizers.values()], 'lr': self.config.vq_logits_lr},
+            ], lr=0.0, eps=1e-15)
+            self.scheduler_vq = torch.optim.lr_scheduler.MultiStepLR(self.optimizer_vq, milestones=[12000], gamma=.1)
         return torch.optim.Adam(groups, lr=0.0, eps=1e-15)
 
     def update_learning_rates(self, optimizer, step):
@@ -319,6 +397,16 @@ class SmolGS(nn.Module):
                     optimizer.state[new] = state
         for name in ("cells", "grad_accum", "vis_count", "opacity_accum", "last_seen"):
             setattr(self, name, getattr(self, name)[indices].clone())
+        for name in ('coordinate_cells', 'coordinate_regions'):
+            setattr(self, name, getattr(self, name)[indices].clone())
+        if self.config.geometry_quantization == 'ecvq':
+            for key in ('scale', 'rot'):
+                cache = getattr(self, key+'_index_cache')[indices].clone()
+                if log_scales is not None:
+                    cache.fill_(-1)
+                elif new_start is not None:
+                    cache[new_start:] = -1
+                setattr(self, key+'_index_cache', cache)
 
     @torch.no_grad()
     def collect_statistics(self, attributes, visible, step, viewspace_points=None):
@@ -343,9 +431,8 @@ class SmolGS(nn.Module):
     def density_control(self, optimizer, camera_center, step, max_splats=None):
         """Clone small splats; replace large parents with two smaller children.
 
-        Sizes and sampling covariance use rendered axes. In explicit mode
-        these are camera independent; children inherit the parent's rotation.
-        Log scales shrink by log(0.8*2) for split children in both modes.
+        Sizes and sampling covariance use camera-independent physical axes.
+        Children inherit the parent's rotation; split log scales shrink by log(1.6).
         """
         self.last_adc_report = {}
         if not self.config.warmup_until < step <= self.config.compact_until:
@@ -420,37 +507,11 @@ class SmolGS(nn.Module):
 
     @property
     def point_parameter_names(self):
-        names = ('xyz', 'features', 'log_scales')
-        return names+('rotations',) if self.config.geometry_mode == 'explicit' else names
+        return ('xyz', 'features', 'log_scales', 'rotations')
 
     @torch.no_grad()
-    def freeze_coordinates(self, optimizer=None):
+    def freeze_coordinates(self, optimizer=None, scores=None):
         if bool(self.coordinate_frozen):
             return 0
-        if not torch.isfinite(self.xyz).all():
-            raise RuntimeError("Coordinate quantization rejected nonfinite positions")
-        lo = self.xyz.amin(0)
-        hi = torch.maximum(self.xyz.amax(0), lo+1e-6)
-        cells, centers = quantize_cells(self.xyz, lo, hi, self.config.octree_depth)
-        codes = morton_codes(cells, self.config.octree_depth)
-        order = torch.argsort(codes, stable=True)
-        sorted_codes = codes[order]
-        keep = torch.ones_like(sorted_codes, dtype=torch.bool)
-        keep[1:] = sorted_codes[1:] != sorted_codes[:-1]
-        indices = order[keep]
-        removed = len(self.xyz)-len(indices)
-        fraction = removed/len(self.xyz)
-        if fraction > self.config.coordinate_max_collision_fraction:
-            raise RuntimeError(f"Coordinate quantization would remove {removed}/{len(self.xyz)} "
-                               f"splats ({fraction:.2%}), above the collision limit "
-                               f"{self.config.coordinate_max_collision_fraction:.2%}; "
-                               f"bbox extent={(hi-lo).tolist()}. Inspect geometry before compression.")
-        # Commit only after the collision check; a rejection leaves topology,
-        # bounds, freeze flags and optimizer state untouched.
-        self.bounds_min.copy_(lo)
-        self.bounds_max.copy_(hi)
-        self.replace_topology(indices, optimizer, centers[indices])
-        self.cells = cells[indices]
-        self.coordinate_frozen.fill_(True)
-        self.xyz.requires_grad_(False)
-        return removed
+        from smolgs.coordinate_grid import freeze_grid
+        return freeze_grid(self, optimizer, scores)

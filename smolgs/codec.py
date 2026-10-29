@@ -3,6 +3,7 @@
 No checkpoint, source scene, or SfM data is required for decoding.
 """
 from pathlib import Path
+import copy
 import hashlib
 import importlib.util
 import io
@@ -15,8 +16,9 @@ import torch
 from utils.arithmetic import encode_gaussian_symbols, decode_gaussian_symbols
 from utils.checkpoint import load_torch
 from arguments import Config
+from utils.formats import ARCHIVE_FORMAT
 from scene.gaussian_model import SmolGS
-from utils.octree import encode_octree, decode_octree
+from smolgs.coordinate_grid import encode_coordinates, decode_coordinates
 
 
 def _hac():
@@ -29,7 +31,7 @@ def _hac():
 
 def _network_files(model):
     # Store only the networks and spatial metadata; never store raw splat features.
-    names = ('opacity_mlp.', 'color_mlp.', 'rotation_mlp.', 'scale_mlp.',
+    names = ('opacity_mlp.', 'color_mlp.',
              'entropy_mlp.', 'octree_mlp.', 'hash_encoder.')
     state = {}
     binary = {}
@@ -77,7 +79,7 @@ def _canonical_model(model, context_device):
             config.hash_backend = 'cuda'
     result = SmolGS(config, device=context_device)
     state = {name: value for name, value in model.state_dict().items()
-             if name.startswith(('opacity_mlp.', 'color_mlp.', 'rotation_mlp.', 'scale_mlp.',
+             if name.startswith(('opacity_mlp.', 'color_mlp.',
                                  'entropy_mlp.', 'octree_mlp.', 'hash_encoder.'))}
     result.load_state_dict(state, strict=False)
     result.bounds_min.copy_(model.bounds_min)
@@ -105,12 +107,82 @@ def _quantized_symbols(values, steps):
 
 def _attribute_contexts(model, xyz):
     """Only attributes actually quantized by this model get arithmetic streams."""
-    prior = model.prior(xyz)
-    if model.config.geometry_mode == 'explicit':
-        mf, sf, qf = prior
-        return {'features': (mf, sf, qf)}
-    mf, sf, ms, ss, qf, qs = prior
-    return {'features': (mf, sf, qf), 'scales': (ms, ss, qs)}
+    mf, sf, qf = model.prior(xyz)
+    return {'features': (mf, sf, qf)}
+
+
+@torch.no_grad()
+def _ecvq_geometry(model, order):
+    """Assign once, then shrink/remap exactly as RDO shrink_codebook does."""
+    if not all(bool(q.initialized) for q in model.quantizers.values()):
+        raise ValueError('ECVQ codebooks must be initialized before export')
+    result = {}
+    for key, values in (('scale', model.log_scales[order].exp()), ('rot', model.rotations[order])):
+        quantizer = model.quantizers[key]
+        if not torch.isfinite(quantizer.codebook).all() or not torch.isfinite(quantizer.logits).all():
+            raise ValueError('Nonfinite ECVQ codebook or logits')
+        if key == 'scale':
+            # RDO apply_and_save_vq calls remove_negatives before assignment.
+            # Apply its exact <0 rule on an export copy; leave training intact.
+            quantizer = copy.deepcopy(quantizer)
+            quantizer.codebook[quantizer.codebook < 0] = 1e-8
+        assigned = quantizer(values, rate_constrain=bool(model.vq_rate_constrained))
+        original = assigned['x_index'].cpu().numpy().reshape(-1)
+        used, index = np.unique(original, return_inverse=True)
+        book = quantizer.codebook[0].detach().cpu().numpy()[used].astype('<f4')
+        logits = quantizer.logits[0, torch.as_tensor(used, device=quantizer.logits.device)].cpu()
+        result[key] = {'codebook': book, 'indices': index.astype(np.int64)[:, None], 'logits': logits}
+    return result
+
+
+def _npy(value):
+    buffer = io.BytesIO()
+    np.save(buffer, value, allow_pickle=False)
+    return buffer.getvalue()
+
+
+def _materialize_geometry(model, geometry):
+    """Store lookup results exactly, avoiding exp(log(codeword)) roundoff."""
+    for key in ('scale', 'rot'):
+        book = torch.as_tensor(geometry[key]['codebook'].copy(), device=model.xyz.device)
+        index = torch.as_tensor(geometry[key]['indices'].copy(), device=model.xyz.device, dtype=torch.long)
+        quantizer = model.quantizers[key]
+        quantizer.codebook = torch.nn.Parameter(book[None], requires_grad=False)
+        quantizer.logits = torch.nn.Parameter(torch.zeros(1, len(book), device=book.device), requires_grad=False)
+        quantizer.cb_size = len(book)
+        quantizer.initialized.fill_(True)
+        setattr(model.config, 'vq_scale_cbsize' if key == 'scale' else 'vq_rot_cbsize', len(book))
+        setattr(model, key+'_indices', index)
+        values = book[index[:, 0]]
+        if key == 'scale':
+            model.decoded_scales = values
+            model.log_scales.copy_(values.log())
+        else:
+            model.rotations.copy_(values)
+    model.vq_rate_constrained.fill_(model.config.iterations >= model.config.rate_constrain_iter)
+    model.decoded.fill_(True)
+
+
+@torch.no_grad()
+def export_reference(model, codec='cpu'):
+    """Actual export decisions without decoding the resulting bitstream."""
+    if model.config.geometry_quantization != 'ecvq':
+        return quantized_hash_reference(model)
+    _, _, order, canonical_xyz = encode_coordinates(model)
+    geometry = _ecvq_geometry(model, order)
+    reference = quantized_hash_reference(model)
+    reference.replace_topology(order)
+    context_device = 'cpu' if codec == 'cpu' else str(model.xyz.device)
+    if model.config.appearance_backend == 'tcnn' or model.config.octree_backend == 'tcnn':
+        context_device = str(model.xyz.device)
+    predictor = _canonical_model(model, context_device)
+    xyz = canonical_xyz.to(context_device)
+    reference.xyz.copy_(xyz.to(reference.xyz.device))
+    _, _, step = predictor.prior(xyz)
+    feature = model.features[order].to(context_device)
+    reference.features.copy_((torch.round(feature/step)*step).to(reference.xyz.device))
+    _materialize_geometry(reference, geometry)
+    return reference
 
 
 @torch.no_grad()
@@ -133,16 +205,27 @@ def encode_model(model, output, codec='cpu', chunk_splats=2048):
         raise ValueError('HAC CUDA arithmetic coding requires a CUDA model')
     files, binary = _network_files(model)
     predictor = _canonical_model(model, context_device)
-    octree, order = encode_octree(model.cells.cpu().numpy(), model.config.octree_depth)
-    files['coordinates.oct'] = octree
-    order = torch.as_tensor(order.astype(np.int64), device=model.xyz.device)
-    cells = model.cells[order].to(context_device)
+    coordinate_files, coordinate_layout, order, canonical_xyz = encode_coordinates(model)
+    files.update(coordinate_files)
     # Reconstruct exactly the coordinate tensor that the independent decoder will use.
-    xyz = predictor.bounds_min+(cells.to(torch.float32)+0.5)*(
-        predictor.bounds_max-predictor.bounds_min).clamp_min(1e-6)/(1 << model.config.octree_depth)
+    xyz = canonical_xyz.to(context_device)
     features = model.features[order].to(context_device)
     attributes = {'features': features}
-    if model.config.geometry_mode == 'explicit':
+    geometry_meta = {}
+    if model.config.geometry_quantization == 'ecvq':
+        from smolgs.vq.coding import cdf_from_logits, encode_indices, decode_indices
+        for key, data in _ecvq_geometry(model, order).items():
+            cdf = cdf_from_logits(data['logits'])
+            stream = encode_indices(data['indices'], cdf)
+            if not np.array_equal(decode_indices(stream, cdf, len(xyz)), data['indices']):
+                raise RuntimeError('ECVQ index roundtrip mismatch')
+            prefix = 'geometry/'+key
+            files[prefix+'_codebook.npy'] = _npy(data['codebook'])
+            files[prefix+'_cdf.npy'] = _npy(cdf)
+            files[prefix+'_indices.rans'] = stream
+            geometry_meta[key] = {'codes': len(data['codebook']), 'codebook': prefix+'_codebook.npy',
+                                 'cdf': prefix+'_cdf.npy', 'indices': prefix+'_indices.rans'}
+    else:
         # Step-one geometry has no lossy quantization or learned rate model.
         # Save raw FP32 log scales/quaternions in exactly the octree order.
         for name in ('log_scales', 'rotations'):
@@ -156,8 +239,6 @@ def encode_model(model, output, codec='cpu', chunk_splats=2048):
             buffer = io.BytesIO()
             np.save(buffer, value.astype('<f4'), allow_pickle=False)
             files[f'geometry/{name}.npy'] = buffer.getvalue()
-    else:
-        attributes['scales'] = model.log_scales[order].exp().to(context_device)
     # Use the same complete-scene batch as checkpoint inference. Re-evaluating
     # the entropy MLP on adaptive stream chunks changes floating-point GEMM
     # results slightly; near half-integers this can change quantized symbols.
@@ -219,10 +300,12 @@ def encode_model(model, output, codec='cpu', chunk_splats=2048):
             if start//chunk_splats % 20 == 0 or end == len(xyz):
                 print(f'[Encode] {end:,}/{len(xyz):,} splats ({100*end/len(xyz):.1f}%)', flush=True)
     segmented = sum(isinstance(chunk[label], list) for chunk in chunks for label in attributes)
-    archive_format = ('smolgs-archive-v7-explicit' if model.config.geometry_mode == 'explicit'
-                      else 'smolgs-archive-v6')
-    metadata = {'format': archive_format, 'geometry_mode': model.config.geometry_mode,
-                'geometry_storage': 'lossless-fp32' if model.config.geometry_mode == 'explicit' else 'scalar-controller',
+    metadata = {'format': ARCHIVE_FORMAT, 'geometry_mode': model.config.geometry_mode,
+                'geometry_quantization': model.config.geometry_quantization,
+                'coordinate_layout': coordinate_layout,
+                'geometry_storage': 'rdo-rans16-v1' if geometry_meta else
+                                    'lossless-fp32',
+                'geometry': geometry_meta,
                 'hash_model': 'hac-binary-mixed-detached-v1',
                 'context_layout': 'full-scene-v1',
                 'implementation': 'independent-paper-reproduction',
@@ -252,8 +335,8 @@ def decode_model(path, device='cpu'):
     started = time.perf_counter()
     with zipfile.ZipFile(path) as archive:
         meta = json.loads(archive.read('metadata.json'))
-        if meta.get('format') not in ('smolgs-archive-v6', 'smolgs-archive-v7-explicit'):
-            raise ValueError('Unsupported archive format; expected v6 neural or v7-explicit')
+        if meta.get('format') != ARCHIVE_FORMAT:
+            raise ValueError(f'Unsupported archive format; expected {ARCHIVE_FORMAT}')
         if meta.get('hash_model') != 'hac-binary-mixed-detached-v1' or meta.get('context_layout') != 'full-scene-v1':
             raise ValueError('Unsupported hash model or context layout')
         files = {name: archive.read(name) for name in meta['files_sha256']}
@@ -261,11 +344,32 @@ def decode_model(path, device='cpu'):
         if hashlib.sha256(data).hexdigest() != meta['files_sha256'][name]:
             raise ValueError(f'Archive checksum mismatch: {name}')
     config = Config.from_saved(meta['config'])
-    expected_mode = 'explicit' if meta['format'] == 'smolgs-archive-v7-explicit' else 'neural'
-    if config.geometry_mode != expected_mode or meta.get('geometry_mode', 'neural') != expected_mode:
-        raise ValueError('Archive geometry mode/format mismatch')
-    if expected_mode == 'explicit' and meta.get('geometry_storage') != 'lossless-fp32':
-        raise ValueError('Unsupported explicit geometry storage')
+    is_ecvq = config.geometry_quantization == 'ecvq'
+    if meta.get('geometry_quantization') != config.geometry_quantization:
+        raise ValueError('Archive geometry quantization/config mismatch')
+    if meta.get('geometry_mode') != config.geometry_mode:
+        raise ValueError('Archive geometry mode/config mismatch')
+    expected_storage = ('rdo-rans16-v1' if is_ecvq else
+                        'lossless-fp32')
+    if meta.get('geometry_storage') != expected_storage:
+        raise ValueError('Unsupported geometry storage')
+    geometry = {}
+    if is_ecvq:
+        from smolgs.vq.coding import decode_indices, validate_cdf
+        if set(meta.get('geometry', {})) != {'scale', 'rot'} or meta['count'] < 1:
+            raise ValueError('Invalid ECVQ geometry metadata')
+        for key, width in (('scale', 3), ('rot', 4)):
+            description = meta['geometry'][key]
+            book = np.load(io.BytesIO(files[description['codebook']]), allow_pickle=False)
+            codes = description['codes']
+            if (not isinstance(codes, int) or not 0 < codes < 65536 or book.shape != (codes, width)
+                    or book.dtype != np.dtype('<f4') or not np.isfinite(book).all()
+                    or (key == 'scale' and not (book >= 0).all())):
+                raise ValueError('Invalid ECVQ codebook')
+            cdf = validate_cdf(np.load(io.BytesIO(files[description['cdf']]), allow_pickle=False), codes)
+            index = decode_indices(files[description['indices']], cdf, meta['count'])
+            geometry[key] = {'codebook': book, 'indices': index}
+            setattr(config, 'vq_scale_cbsize' if key == 'scale' else 'vq_rot_cbsize', codes)
     context_device = 'cpu' if meta['context_device'] == 'cpu' else device
     if meta['context_device'] == 'cuda' and not str(device).startswith('cuda'):
         raise ValueError('This archive requires --device cuda for its native networks/contexts')
@@ -290,13 +394,10 @@ def decode_model(path, device='cpu'):
     model.load_state_dict(weights, strict=False)
     for name in ('bounds_min', 'bounds_max', 'hash_min', 'hash_max'):
         getattr(model, name).copy_(torch.tensor(meta[name], device=context_device))
-    cells, depth = decode_octree(files['coordinates.oct'])
-    if depth != config.octree_depth or len(cells) != meta['count']:
-        raise ValueError('Archive coordinate metadata mismatch')
-    model.cells = torch.as_tensor(cells, device=context_device)
-    model.xyz.copy_(model.bounds_min+(model.cells.to(torch.float32)+0.5)*(
-        model.bounds_max-model.bounds_min).clamp_min(1e-6)/(1 << depth))
-    if config.geometry_mode == 'explicit':
+    decode_coordinates(model, files, meta['coordinate_layout'], meta['count'])
+    if is_ecvq:
+        _materialize_geometry(model, geometry)
+    else:
         for name, width in (('log_scales', 3), ('rotations', 4)):
             value = np.load(io.BytesIO(files[f'geometry/{name}.npy']), allow_pickle=False)
             if value.shape != (meta['count'], width) or value.dtype != np.dtype('<f4') or not np.isfinite(value).all():
@@ -341,10 +442,7 @@ def decode_model(path, device='cpu'):
                     values.reshape(-1)[first:last].copy_(decoded)
                 if cursor != means.numel():
                     raise ValueError('Missing attribute segments')
-                if label == 'features':
-                    model.features[start:end].copy_(values)
-                else:
-                    model.log_scales[start:end].copy_(values.clamp_min(1e-7).log())
+                model.features[start:end].copy_(values)
     if expected_start != meta['count']:
         raise ValueError('Missing attribute chunks')
     model.coordinate_frozen.fill_(True)
@@ -355,4 +453,4 @@ def decode_model(path, device='cpu'):
     return model, {'decode_seconds': time.perf_counter()-started, 'splats': len(model.xyz),
                    'size_MB': Path(path).stat().st_size/1e6, 'codec': meta['codec'],
                    'geometry_mode': config.geometry_mode,
-                   'geometry_storage': meta.get('geometry_storage', 'scalar-controller')}
+                   'geometry_storage': meta['geometry_storage']}

@@ -1,0 +1,14 @@
+{
+  "geometry_mode": "explicit",
+  "geometry_quantization": "ecvq",
+  "vq_start_iter": 20001,
+  "rate_constrain_iter": 25001,
+  "vq_scale_cbsize": 8192,
+  "vq_rot_cbsize": 8192,
+  "vq_scale_lmbda": 4096,
+  "vq_rot_lmbda": 256,
+  "vq_cb_lr": 0.0002,
+  "vq_logits_lr": 0.002,
+  "vq_patch_size": 16384,
+  "reactivate_codeword_period": 1000
+}

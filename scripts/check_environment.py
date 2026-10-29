@@ -19,7 +19,7 @@ def main():
     if torch.cuda.is_available():
         report['gpu'] = torch.cuda.get_device_name()
         report['compute_capability'] = list(torch.cuda.get_device_capability())
-    for name in ['diff_gaussian_rasterization', 'simple_knn._C', '_gridencoder', 'tinycudann', 'arithmetic', 'lpips']:
+    for name in ['diff_gaussian_rasterization', 'simple_knn._C', '_gridencoder', 'tinycudann', 'arithmetic', 'lpips', 'smolgs_rdo_entropy.rans']:
         try:
             module = importlib.import_module(name)
             report['extensions'][name] = {'available': True, 'path': module.__file__}
